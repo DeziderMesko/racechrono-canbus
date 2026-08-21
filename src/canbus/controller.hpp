@@ -117,6 +117,11 @@ private:
     std::atomic<uint32_t> _rc_count;
     std::atomic<uint32_t> _dr_count;
     std::atomic<uint32_t> _hw_count;
+    /// frame classes the ISR discards without queueing. Cumulative like the drop
+    /// counter, because the useful reading is "none seen at all" and an average
+    /// would bury a handful of them.
+    std::atomic<uint32_t> _ef_count;
+    std::atomic<uint32_t> _rt_count;
     intr_handle_t _isr_handle;
     /// frames the queue holds while core 0 is not draining it. At the R9's ~1050
     /// msg/s that is ~1.9 s of bus, and ~0.5 s of a saturated 500 kbps one. Costs

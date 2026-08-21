@@ -61,6 +61,8 @@ controller::controller() noexcept
     , _rc_count(0U)
     , _dr_count(0U)
     , _hw_count(0U)
+    , _ef_count(0U)
+    , _rt_count(0U)
     , _isr_handle(nullptr)
     , _queue_storage{}
     , _static_queue{}
@@ -92,6 +94,8 @@ void controller::stats() noexcept
             // and the peak is what says whether the queue is big enough
             uint32_t dr_count = _dr_count.load(std::memory_order_relaxed);
             uint32_t hw_count = _hw_count.load(std::memory_order_relaxed);
+            uint32_t ef_count = _ef_count.load(std::memory_order_relaxed);
+            uint32_t rt_count = _rt_count.load(std::memory_order_relaxed);
 
             infoln("       Interrupts/s: %.2f", (static_cast<float>(ir_count) / static_cast<float>(delta)) * 1e6f);
             infoln("           Errors/s: %.2f", (static_cast<float>(er_count) / static_cast<float>(delta)) * 1e6f);
@@ -100,6 +104,8 @@ void controller::stats() noexcept
             infoln("              Queue: %4u / %4u", waiting, available);
             infoln("         Queue peak: %4u of %4u", hw_count, _queue_length);
             infoln("     Dropped frames: %4u", dr_count);
+            infoln("    Extended frames: %4u", ef_count);
+            infoln("      Remote frames: %4u", rt_count);
         }
     }
 }
@@ -269,14 +275,19 @@ void controller::isr() noexcept
             frame f;
             f.info.u8 = dev->tx_rx_buffer[0].val;
 
+            // Remote-transmission requests and 29-bit frames are both discarded
+            // here. Count them: a sniffer that throws a class of traffic away
+            // without a tally cannot tell you afterwards that the class was empty.
             if (f.info.rtr == frame_rtr::remote)
             {
+                _rt_count.fetch_add(1, std::memory_order_relaxed);
                 twai_ll_set_cmd_release_rx_buffer(dev);
                 continue;
             }
 
             if (f.info.frame_format == frame_format::extended)
             {
+                _ef_count.fetch_add(1, std::memory_order_relaxed);
                 twai_ll_set_cmd_release_rx_buffer(dev);
                 continue;
             }
