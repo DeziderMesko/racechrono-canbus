@@ -24,6 +24,9 @@
 
 #include <cstdio>
 
+// core 3.x no longer pulls esp_mac.h in transitively
+#include <esp_mac.h>
+
 #include "device.hpp"
 
 namespace racechrono
