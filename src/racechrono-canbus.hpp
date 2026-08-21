@@ -74,6 +74,8 @@
 #define CAN_RX_PIN GPIO_NUM_18   // A0
 #define CAN_TX_PIN GPIO_NUM_17   // A1
 #define BLE_PWR_LVL ESP_PWR_LVL_P12
+/// this board has the 240x135 ST7789 and the three buttons; src/display drives them
+#define CONFIG_DISPLAY_TFT 1
 #endif
 
 // ESP32 Dev Module

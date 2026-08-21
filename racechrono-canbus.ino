@@ -23,6 +23,7 @@
 #include "src/canbus/controller.hpp"
 #include "src/canbus/decoder.hpp"
 #include "src/canbus/frame.hpp"
+#include "src/display/display.hpp"
 #include "src/led/led.hpp"
 #include "src/racechrono/device.hpp"
 
@@ -68,6 +69,12 @@ void setup()
     //
 
     assert(xPortGetCoreID() == 1);
+
+    // The panel, on its own task on core 0. Started before anything else has a
+    // status worth showing, so a board that fails to bring the CAN controller up
+    // says so on the glass instead of only over a serial console a release build
+    // does not have.
+    DISP.start();
 
     core0_handle = xTaskCreateStaticPinnedToCore(
         core0,
@@ -128,6 +135,9 @@ void core0(void*)
                 verboseln("PID 0x%03x LEN %u", id, len);
 #endif
                 RCDEV.send(reinterpret_cast<uint8_t*>(&f.id), sizeof(uint32_t) + f.info.dlc);
+                // After the send, not before: the phone is the product, the census is
+                // the instrument, and the instrument never delays the product.
+                DISP.note(f);
             }
             RCDEV.stats();
         }
