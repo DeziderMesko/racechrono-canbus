@@ -112,16 +112,16 @@ public:
      * and the rate limit must be triggered as well.
      * @return true is \p id should be decoded
      */
-    bool should_decode(uint32_t id) noexcept;
+    virtual bool should_decode(uint32_t id) noexcept;
 
 protected:
     explicit decoder(size_t size) noexcept;
 
-    void deny_all() noexcept;
+    virtual void deny_all() noexcept;
 
-    void allow_all() noexcept;
+    virtual void allow_all() noexcept;
 
-    void allow_id(uint32_t id) noexcept;
+    virtual void allow_id(uint32_t id) noexcept;
 
     virtual uint16_t rate(uint32_t id) const noexcept = 0;
 
