@@ -57,9 +57,16 @@
 // Either way the phone has the final say, so the negotiated interval is read back in
 // onConnParamsUpdate() and shown in the display header rather than assumed.
 #define CONFIG_BLE_CONN_ITVL_MIN 6    // 7.5 ms  (iOS: 12, 15.0 ms)
-#define CONFIG_BLE_CONN_ITVL_MAX 12   // 15.0 ms (iOS: 24, 30.0 ms)
+#define CONFIG_BLE_CONN_ITVL_MAX 10   // 12.5 ms (iOS: 24, 30.0 ms)
 #define CONFIG_BLE_CONN_LATENCY  0
 #define CONFIG_BLE_CONN_TIMEOUT  400  // 4 s
+
+/// Send frames through BLECharacteristic::notify() instead of straight at the NimBLE
+/// host. Slower by three heap allocations and a mutex per frame, and kept only so the
+/// two paths can be measured against each other on one afternoon's connection -- the
+/// phone renegotiates the connection interval on every reconnect, so an A/B that needs
+/// two firmware builds needs them within the same negotiated interval to mean anything.
+// #define RC_WRAPPER_NOTIFY
 
 /// if DEBUG is defined, logger will be enabled and print to serial console
 // #define DEBUG

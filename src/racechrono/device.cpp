@@ -101,6 +101,7 @@ void device::onDisconnect(BLEServer*)
     // once connection is made, BLE stops advertising, so on disconnect, start advertising again..
     infoln("Bluetooth LE client disconnected!");
     _client_connected = false;
+    _conn_handle.store(BLE_HS_CONN_HANDLE_NONE, std::memory_order_relaxed);
     _conn_interval.store(0U, std::memory_order_relaxed);
     _mtu.store(0U, std::memory_order_relaxed);
     _subscribed.store(false, std::memory_order_relaxed);
@@ -112,6 +113,9 @@ void device::onDisconnect(BLEServer*)
 void device::onConnect(BLEServer* server, ble_gap_conn_desc* desc)
 {
     _conn_interval.store(desc->conn_itvl, std::memory_order_relaxed);
+    // Kept because the frame path notifies the host directly and the host addresses
+    // connections, not characteristics.
+    _conn_handle.store(desc->conn_handle, std::memory_order_relaxed);
 
     infoln("Bluetooth LE connected: interval %u (%.2f ms) latency %u timeout %u ms",
         desc->conn_itvl, desc->conn_itvl * 1.25f, desc->conn_latency,
@@ -150,12 +154,25 @@ void device::onConnParamsUpdate(uint16_t, uint16_t interval, uint16_t latency,
         interval, interval * 1.25f, latency, timeout * 10U, status);
 }
 
-void device::onSubscribe(BLECharacteristic*, ble_gap_conn_desc*, uint16_t sub)
+void device::onSubscribe(BLECharacteristic* chr, ble_gap_conn_desc*, uint16_t sub)
 {
     // bit 0 is notifications, bit 1 indications; RaceChrono asks for the former
     bool on = (sub & 0x0001) != 0;
     _subscribed.store(on, std::memory_order_relaxed);
-    infoln("Bluetooth LE subscribe 0x%04x -> notifications %s", sub, on ? "on" : "off");
+
+    // The one moment the frame characteristic's handle is certain to be resolved: the
+    // wrapper's copy is filled in by NimBLE while it registers the GATT table, which
+    // happens after createCharacteristic() and after start() have both returned, and a
+    // subscription cannot exist before the table does.
+    //
+    // Read it any earlier and getHandle() returns null_handle, which is the trap this
+    // comment exists for: ble_gatts_notify_custom() accepts that handle, returns 0, and
+    // puts a notification on the air addressed to an attribute that does not exist.
+    // Every counter on the board reads healthy and the phone receives nothing.
+    _frames_handle = chr->getHandle();
+
+    infoln("Bluetooth LE subscribe 0x%04x -> notifications %s, frame handle %u",
+        sub, on ? "on" : "off", _frames_handle);
 }
 
 #endif // CONFIG_NIMBLE_ENABLED
@@ -199,21 +216,25 @@ void device::stats() noexcept
             uint32_t count = total - exchange(_ble_last, total);
             float msg_per_sec = (static_cast<float>(count) / static_cast<float>(delta)) * 1e6f;
             infoln(" Bluetooth LE msg/s: %.2f", msg_per_sec);
-            // notified should read twice offered: NimBLE reports every notification
-            // once when the host queues it and once when the controller transmits it
-            infoln(" Bluetooth LE offered: %lu notified: %lu",
+            // transmitted counts BLE_GAP_EVENT_NOTIFY_TX, which is the frame going
+            // onto the air. It read twice offered while the frame path went through
+            // BLECharacteristic::notify(), because that reports the host accepting the
+            // frame as a second success. Going straight at the host left only the
+            // event that means something, so a healthy link now reads 1:1
+            infoln(" Bluetooth LE offered: %lu transmitted: %lu",
                 (unsigned long)total,
                 (unsigned long)_ble_count.load(std::memory_order_relaxed));
             infoln(" Bluetooth LE lost: %lu nosub: %lu err: %ld",
                 (unsigned long)_ble_lost.load(std::memory_order_relaxed),
                 (unsigned long)_ble_nosub.load(std::memory_order_relaxed),
                 (long)_ble_err.load(std::memory_order_relaxed));
-            infoln(" Bluetooth LE link: %s peers %u sub %s interval %.2f ms mtu %u",
+            infoln(" Bluetooth LE link: %s peers %u sub %s interval %.2f ms mtu %u handle %u",
                 connected() ? "up" : "down",
                 peers(),
                 subscribed() ? "yes" : "no",
                 _conn_interval.load(std::memory_order_relaxed) * 1.25f,
-                _mtu.load(std::memory_order_relaxed));
+                _mtu.load(std::memory_order_relaxed),
+                _frames_handle);
         }
     }
 }

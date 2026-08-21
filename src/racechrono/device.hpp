@@ -30,6 +30,12 @@
 #include <BLECharacteristic.h>
 #include <BLEDevice.h>
 
+#if defined(CONFIG_NIMBLE_ENABLED)
+#include <host/ble_gatt.h>
+#include <host/ble_hs.h>
+#include <host/ble_hs_mbuf.h>
+#endif
+
 namespace racechrono
 {
 
@@ -183,17 +189,73 @@ public:
 
     /**
      * Send \p data of size \p len over Bluetooth LE stack as an LE notification.
+     *
+     * On NimBLE this goes straight at the host and past BLECharacteristic::notify(),
+     * which costs two String assignments and a semaphore for every frame: setValue()
+     * copies the bytes into a String under a mutex, notify() copies that String again
+     * into a local one, and only then builds the mbuf the host actually wanted. Three
+     * heap allocations to move twelve bytes that were already flat in memory, on a path
+     * that runs a thousand times a second.
+     *
+     * The wrapper is still what defines the characteristic, tracks the subscription and
+     * delivers onStatus() -- only the per-frame call is bypassed.
      */
     __always_inline void send(uint8_t* data, size_t len) noexcept
     {
-        if (_client_connected)
+        if (!_client_connected)
         {
-            _ble_offered.fetch_add(1, std::memory_order_relaxed);
-            _canbus_frames->setValue(data, len);
-            // The outcome is counted in onStatus(), not here: notify() returns void,
-            // and offering a frame to a congested stack is not the same as sending it.
-            _canbus_frames->notify();
+            return;
         }
+
+        _ble_offered.fetch_add(1, std::memory_order_relaxed);
+
+#if defined(CONFIG_NIMBLE_ENABLED) && !defined(RC_WRAPPER_NOTIFY)
+        if (RCLIKELY(_frames_handle != null_handle))
+        {
+            uint16_t conn = _conn_handle.load(std::memory_order_relaxed);
+
+            if (conn == BLE_HS_CONN_HANDLE_NONE || !_subscribed.load(std::memory_order_relaxed))
+            {
+                // Nowhere to send it: counted apart from congestion, because the fix is
+                // on the phone rather than on the board.
+                _ble_nosub.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+
+            os_mbuf* om = ble_hs_mbuf_from_flat(data, len);
+
+            if (om == nullptr)
+            {
+                // Out of mbufs before the host was even asked. Same exhaustion as a
+                // refused notification, one step earlier, so it is counted the same.
+                _ble_lost.fetch_add(1, std::memory_order_relaxed);
+                _ble_err.store(BLE_HS_ENOMEM, std::memory_order_relaxed);
+                return;
+            }
+
+            // Consumes the mbuf whatever the outcome, so there is nothing to free here.
+            int rc = ble_gatts_notify_custom(conn, _frames_handle, om);
+
+            if (RCUNLIKELY(rc != 0))
+            {
+                _ble_lost.fetch_add(1, std::memory_order_relaxed);
+                _ble_err.store(static_cast<uint32_t>(rc), std::memory_order_relaxed);
+            }
+
+            // Success is not counted here. BLE_GAP_EVENT_NOTIFY_TX still arrives -- the
+            // server dispatches it by attribute handle, not by who called the host --
+            // so onStatus() counts what actually reached the air, which is the number
+            // worth having.
+            return;
+        }
+#endif
+
+        // Bluedroid, or a NimBLE build where the characteristic handle never turned up
+        // -- nothing has subscribed yet, in practice.
+        _canbus_frames->setValue(data, len);
+        // The outcome is counted in onStatus(), not here: notify() returns void,
+        // and offering a frame to a congested stack is not the same as sending it.
+        _canbus_frames->notify();
     }
 
     /**
@@ -255,6 +317,12 @@ public:
 #endif
 
 private:
+    // What the Arduino BLE wrapper uses for "this handle is not known yet". It is not
+    // exported, and it is the value getHandle() returns before NimBLE has registered
+    // the GATT table -- which is a live trap, because the host will transmit a
+    // notification addressed to it perfectly happily and no phone will ever see one.
+    static constexpr uint16_t null_handle = 0xffffU;
+
     // RaceChrono BLE service UUID
     static constexpr uint16_t racechrono_service_uuid = 0x1ff8;
 
@@ -270,6 +338,8 @@ private:
         , _pid_requests(nullptr)
         , _canbus_frames(nullptr)
         , _2902_desc{}
+        , _frames_handle(null_handle)
+        , _conn_handle(BLE_HS_CONN_HANDLE_NONE)
         , _client_connected(false)
         , _stats_timer{}
         , _ble_offered(0U)
@@ -291,11 +361,21 @@ private:
     BLECharacteristic* _pid_requests;
     BLECharacteristic* _canbus_frames;
     BLE2902 _2902_desc;
+    /// attribute handle of the frame characteristic, for the direct notify path.
+    /// Resolved in onSubscribe() rather than at creation: NimBLE fills the wrapper's
+    /// copy in while it registers the GATT table, so reading it any earlier returns
+    /// null_handle. null_handle here means send() falls back to the wrapper.
+    uint16_t _frames_handle;
+    /// the peer's connection handle, from onConnect(); BLE_HS_CONN_HANDLE_NONE when
+    /// nothing is connected. One peer, deliberately -- see peers().
+    std::atomic<uint16_t> _conn_handle;
     bool _client_connected;
     utils::timer _stats_timer;
     /// cumulative: frames handed to the stack, one per frame off the queue
     std::atomic<uint32_t> _ble_offered;
-    /// cumulative: successful notifications, which is frames x subscribers
+    /// cumulative: notifications the controller actually transmitted, counted from
+    /// BLE_GAP_EVENT_NOTIFY_TX. Reads 1:1 against offered on a healthy link, and the
+    /// shortfall is what never made it onto the air
     std::atomic<uint32_t> _ble_count;
     /// cumulative: notifications the stack refused, congestion being the usual reason
     std::atomic<uint32_t> _ble_lost;
