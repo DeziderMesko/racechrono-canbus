@@ -121,7 +121,11 @@ bool controller::install() noexcept
 #if SOC_TWAI_SUPPORT_MULTI_ADDRESS_LAYOUT
     twai_ll_enable_extended_reg_layout(dev);
 #endif
-    twai_ll_set_mode(dev, TWAI_MODE_LISTEN_ONLY);    // freeze REC by changing to LOM mode
+    // Listen-only. The controller is electrically passive: it never drives the bus,
+    // never ACKs a frame and never sends an error frame, so a wrong bit rate or a
+    // wiring mistake cannot disturb the bike's network. It also freezes REC.
+    // ESP32 Arduino core 3.x takes the mode as three flags instead of a twai_mode_t.
+    twai_ll_set_mode(dev, true /* listen_only */, false /* no_ack */, false /* loopback */);
     // reset RX and TX error counters
     twai_ll_set_rec(dev, 0);
     twai_ll_set_tec(dev, 0);
@@ -152,7 +156,8 @@ bool controller::install() noexcept
     bootln("        TSEG2: %3u", t_config.tseg_2);
     bootln("  3x Sampling: %3s", t_config.triple_sampling == 0 ? "No" : "Yes");
 
-    // only setup RX pin, we aren't transmitting any CAN messages on bus
+    // Only the RX pin is set up. TX is left unconnected to the peripheral, so the
+    // pin cannot be driven at all - a second, physical layer of listen-only.
     gpio_set_pull_mode(CAN_RX_PIN, GPIO_FLOATING);
     esp_rom_gpio_connect_in_signal(CAN_RX_PIN, TWAI_RX_IDX, false);
     esp_rom_gpio_pad_select_gpio(CAN_RX_PIN);
