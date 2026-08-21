@@ -45,14 +45,19 @@
 // link layer uses: intervals in 1.25 ms, timeout in 10 ms.
 //
 // The interval is the ceiling on throughput -- the radio only speaks at connection
-// events -- so the R9's ~1050 msg/s wants this as short as it will go. It is not
-// simply set to the 7.5 ms minimum because iOS rejects a request outright unless
-// min >= 15 ms, max >= min + 15 ms, latency <= 30 and timeout <= 6 s, and a rejected
-// request leaves whatever the phone picked on its own. 15-30 ms is legal on both
-// platforms; on an Android-only setup, 6/12 (7.5-15 ms) is worth trying, with the
-// negotiated result read off the display rather than assumed.
-#define CONFIG_BLE_CONN_ITVL_MIN 12   // 15.0 ms
-#define CONFIG_BLE_CONN_ITVL_MAX 24   // 30.0 ms
+// events -- so the R9's ~1050 msg/s wants this as short as it will go, and 7.5 ms is
+// as short as BLE goes.
+//
+// This is the Android window. **Change it before pairing an iPhone**: iOS rejects a
+// connection-parameter request outright unless min >= 15 ms, max >= min + 15 ms,
+// latency <= 30 and timeout <= 6 s, and a rejected request leaves whatever the phone
+// picked on its own -- worse than asking for less. The iOS-safe pair is 12/24
+// (15-30 ms), legal on both platforms.
+//
+// Either way the phone has the final say, so the negotiated interval is read back in
+// onConnParamsUpdate() and shown in the display header rather than assumed.
+#define CONFIG_BLE_CONN_ITVL_MIN 6    // 7.5 ms  (iOS: 12, 15.0 ms)
+#define CONFIG_BLE_CONN_ITVL_MAX 12   // 15.0 ms (iOS: 24, 30.0 ms)
 #define CONFIG_BLE_CONN_LATENCY  0
 #define CONFIG_BLE_CONN_TIMEOUT  400  // 4 s
 
