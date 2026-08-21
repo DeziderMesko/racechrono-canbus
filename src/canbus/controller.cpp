@@ -138,7 +138,19 @@ bool controller::install() noexcept
     twai_timing_config_t t_config = CANDEC.timing();
     twai_filter_config_t f_config = CANDEC.filter();
 
-    twai_ll_set_bus_timing(dev, t_config.brp, t_config.sjw, t_config.tseg_1, t_config.tseg_2, t_config.triple_sampling);
+    // Core 3.x's TWAI_TIMING_CONFIG_*() macros no longer carry a prescaler. They
+    // state the bit rate as quanta_resolution_hz and leave brp at 0, expecting the
+    // twai_* driver to divide the peripheral clock down to it. Nothing does that on
+    // this path, and a brp of 0 reaches the register as a nonsense divider: the
+    // controller then samples at the wrong bit rate, receives nothing, and raises a
+    // single bus error. So derive the prescaler here.
+    uint32_t brp = t_config.brp;
+    if (brp == 0 && t_config.quanta_resolution_hz != 0)
+    {
+        brp = getApbFrequency() / t_config.quanta_resolution_hz;
+    }
+
+    twai_ll_set_bus_timing(dev, brp, t_config.sjw, t_config.tseg_1, t_config.tseg_2, t_config.triple_sampling);
     twai_ll_set_acc_filter(dev, f_config.acceptance_code, f_config.acceptance_mask, f_config.single_filter);
     twai_ll_set_clkout(dev, 0);
     // enable interrupts
@@ -150,7 +162,9 @@ bool controller::install() noexcept
     EXIT_CRITICAL();
 
     bootln("CAN bus timings reset...");
-    bootln("          BRP: %3u", t_config.brp);
+    bootln("     APB clock: %3u MHz", getApbFrequency() / 1000000);
+    bootln("        Quanta: %3u MHz", t_config.quanta_resolution_hz / 1000000);
+    bootln("          BRP: %3u", brp);
     bootln("          SJW: %3u", t_config.sjw);
     bootln("        TSEG1: %3u", t_config.tseg_1);
     bootln("        TSEG2: %3u", t_config.tseg_2);
