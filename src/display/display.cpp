@@ -529,9 +529,15 @@ void display::page_bus() noexcept
     // level a release build never prints, so a link too slow for the bus would
     // otherwise lose frames in complete silence.
     unsigned long ble_lost = RCDEV.lost();
-    row(3, ble_lost ? ST77XX_RED : RCDEV.connected() ? ST77XX_WHITE : ST77XX_YELLOW,
-        "ble %8lu %4lu/s lost %lu",
-        (unsigned long)RCDEV.frames(), (unsigned long)_ble_rate, ble_lost);
+    // peers should never exceed one. The frame path notifies once per subscriber, so a
+    // second connection doubles the BLE traffic for the same bus while every other
+    // counter here keeps looking healthy.
+    unsigned long peers = RCDEV.peers();
+    row(3, (ble_lost || peers > 1) ? ST77XX_RED
+         : RCDEV.connected()       ? ST77XX_WHITE
+                                   : ST77XX_YELLOW,
+        "ble %8lu %4lu/s lost %lu p%lu",
+        (unsigned long)RCDEV.frames(), (unsigned long)_ble_rate, ble_lost, peers);
     row(4, c.queued > (c.capacity / 2) ? ST77XX_YELLOW : ST77XX_WHITE,
         "queue %4lu peak %4lu/%lu",
         (unsigned long)c.queued, (unsigned long)c.peak, (unsigned long)c.capacity);

@@ -195,17 +195,22 @@ void device::stats() noexcept
 
         if (delta > 0UL)
         {
-            uint32_t total = _ble_count.load(std::memory_order_relaxed);
+            uint32_t total = _ble_offered.load(std::memory_order_relaxed);
             uint32_t count = total - exchange(_ble_last, total);
             float msg_per_sec = (static_cast<float>(count) / static_cast<float>(delta)) * 1e6f;
             infoln(" Bluetooth LE msg/s: %.2f", msg_per_sec);
-            infoln(" Bluetooth LE sent: %lu lost: %lu nosub: %lu err: %ld",
+            // notified should read twice offered: NimBLE reports every notification
+            // once when the host queues it and once when the controller transmits it
+            infoln(" Bluetooth LE offered: %lu notified: %lu",
                 (unsigned long)total,
+                (unsigned long)_ble_count.load(std::memory_order_relaxed));
+            infoln(" Bluetooth LE lost: %lu nosub: %lu err: %ld",
                 (unsigned long)_ble_lost.load(std::memory_order_relaxed),
                 (unsigned long)_ble_nosub.load(std::memory_order_relaxed),
                 (long)_ble_err.load(std::memory_order_relaxed));
-            infoln(" Bluetooth LE link: %s sub %s interval %.2f ms mtu %u",
+            infoln(" Bluetooth LE link: %s peers %u sub %s interval %.2f ms mtu %u",
                 connected() ? "up" : "down",
+                peers(),
                 subscribed() ? "yes" : "no",
                 _conn_interval.load(std::memory_order_relaxed) * 1.25f,
                 _mtu.load(std::memory_order_relaxed));

@@ -62,12 +62,30 @@ public:
     }
 
     /**
-     * @return frames the BLE stack accepted for notification since boot. Counted from
-     * onStatus(), so this is what actually went out rather than what was offered.
-     * Cumulative, so a caller derives a rate from its own previous sample -- see
-     * canbus::controller::counters_t.
+     * @return frames handed to the BLE stack since boot, one per frame off the queue.
+     * This is the number comparable to the controller's forwarded count; the two
+     * should track exactly. Cumulative, so a caller derives a rate from its own
+     * previous sample -- see canbus::controller::counters_t.
      */
     __always_inline uint32_t frames() const noexcept
+    {
+        return _ble_offered.load(std::memory_order_relaxed);
+    }
+
+    /**
+     * @return notification outcomes reported since boot, which is **not** the same as
+     * frames(). NimBLE raises onStatus() twice for every notification, from two places
+     * that mean different things: synchronously at the end of notify(), meaning the
+     * host accepted it into its queue, and again from the BLE_GAP_EVENT_NOTIFY_TX GAP
+     * event, meaning the controller actually put it on the air.
+     *
+     * So the healthy reading is **twice frames()**, and the ratio is the diagnostic:
+     * 2:1 is a link that queues and transmits, 1:1 a link that queues and then does
+     * not. The two paths are indistinguishable from inside onStatus() -- both report
+     * SUCCESS_NOTIFY with code 0 -- which is why frames() is counted where the frame
+     * is offered instead.
+     */
+    __always_inline uint32_t notifies() const noexcept
     {
         return _ble_count.load(std::memory_order_relaxed);
     }
@@ -129,6 +147,17 @@ public:
     }
 
     /**
+     * @return how many clients are connected. Should be 1 whenever anything is: the
+     * frame path notifies once per subscriber, so a second connection silently doubles
+     * the BLE traffic for the same bus -- half the link's capacity spent sending every
+     * frame twice, with every other counter looking healthy.
+     */
+    __always_inline uint16_t peers() const noexcept
+    {
+        return _server != nullptr ? static_cast<uint16_t>(_server->getConnectedCount()) : 0U;
+    }
+
+    /**
      * @return negotiated ATT MTU, 0 until the phone negotiates one. A frame is at most
      * 12 bytes, so the 23-byte default is already enough; it is here because a
      * truncating link would otherwise corrupt payloads without saying so.
@@ -159,9 +188,10 @@ public:
     {
         if (_client_connected)
         {
+            _ble_offered.fetch_add(1, std::memory_order_relaxed);
             _canbus_frames->setValue(data, len);
-            // Counted in onStatus(), not here: notify() returns void, and offering a
-            // frame to a congested stack is not the same as sending it.
+            // The outcome is counted in onStatus(), not here: notify() returns void,
+            // and offering a frame to a congested stack is not the same as sending it.
             _canbus_frames->notify();
         }
     }
@@ -242,6 +272,7 @@ private:
         , _2902_desc{}
         , _client_connected(false)
         , _stats_timer{}
+        , _ble_offered(0U)
         , _ble_count(0U)
         , _ble_lost(0U)
         , _ble_nosub(0U)
@@ -262,7 +293,9 @@ private:
     BLE2902 _2902_desc;
     bool _client_connected;
     utils::timer _stats_timer;
-    /// cumulative, never reset: the display reads it too
+    /// cumulative: frames handed to the stack, one per frame off the queue
+    std::atomic<uint32_t> _ble_offered;
+    /// cumulative: successful notifications, which is frames x subscribers
     std::atomic<uint32_t> _ble_count;
     /// cumulative: notifications the stack refused, congestion being the usual reason
     std::atomic<uint32_t> _ble_lost;
