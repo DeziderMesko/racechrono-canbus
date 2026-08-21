@@ -63,6 +63,10 @@ controller::controller() noexcept
     , _hw_count(0U)
     , _ef_count(0U)
     , _rt_count(0U)
+    , _ir_last(0U)
+    , _er_last(0U)
+    , _cb_last(0U)
+    , _rc_last(0U)
     , _isr_handle(nullptr)
     , _queue_storage{}
     , _static_queue{}
@@ -84,10 +88,19 @@ void controller::stats() noexcept
 
         if (delta > 0UL)
         {
-            uint32_t ir_count = _ir_count.exchange(0UL, std::memory_order_relaxed);
-            uint32_t er_count = _er_count.exchange(0UL, std::memory_order_relaxed);
-            uint32_t cb_count = _cb_count.exchange(0UL, std::memory_order_relaxed);
-            uint32_t rc_count = _rc_count.exchange(0UL, std::memory_order_relaxed);
+            // Deltas against this function's own previous sample, rather than
+            // exchange-to-zero. The counters have a second reader now -- the display
+            // task -- and a counter that either reader resets is a counter neither
+            // can trust: in a DEBUG build every stats() line would have silently
+            // subtracted five seconds of traffic from what the panel showed.
+            uint32_t ir_total = _ir_count.load(std::memory_order_relaxed);
+            uint32_t er_total = _er_count.load(std::memory_order_relaxed);
+            uint32_t cb_total = _cb_count.load(std::memory_order_relaxed);
+            uint32_t rc_total = _rc_count.load(std::memory_order_relaxed);
+            uint32_t ir_count = ir_total - exchange(_ir_last, ir_total);
+            uint32_t er_count = er_total - exchange(_er_last, er_total);
+            uint32_t cb_count = cb_total - exchange(_cb_last, cb_total);
+            uint32_t rc_count = rc_total - exchange(_rc_last, rc_total);
             uint32_t waiting = uxQueueMessagesWaiting(_queue);
             uint32_t available = uxQueueSpacesAvailable(_queue);
             // these two are cumulative on purpose: a single dropped frame matters,
@@ -110,6 +123,37 @@ void controller::stats() noexcept
     }
 }
 #endif
+
+controller::counters_t controller::counters() noexcept
+{
+    counters_t c;
+    c.interrupts = _ir_count.load(std::memory_order_relaxed);
+    c.errors     = _er_count.load(std::memory_order_relaxed);
+    c.frames     = _cb_count.load(std::memory_order_relaxed);
+    c.forwarded  = _rc_count.load(std::memory_order_relaxed);
+    c.dropped    = _dr_count.load(std::memory_order_relaxed);
+    c.peak       = _hw_count.load(std::memory_order_relaxed);
+    c.extended   = _ef_count.load(std::memory_order_relaxed);
+    c.remote     = _rt_count.load(std::memory_order_relaxed);
+    c.queued     = _queue ? uxQueueMessagesWaiting(_queue) : 0U;
+    c.capacity   = _queue_length;
+    return c;
+}
+
+uint32_t controller::status() const noexcept
+{
+    return twai_ll_get_status(dev);
+}
+
+uint32_t controller::tec() const noexcept
+{
+    return twai_ll_get_tec(dev);
+}
+
+uint32_t controller::rec() const noexcept
+{
+    return twai_ll_get_rec(dev);
+}
 
 bool controller::install() noexcept
 {
@@ -266,12 +310,16 @@ void controller::isr() noexcept
 
     if (interrupts & TWAI_LL_INTR_RI)
     {
-        _cb_count.fetch_add(1, std::memory_order_relaxed);
-
         // TODO: SOC_TWAI_SUPPORTS_RX_STATUS
         uint32_t msg_count = twai_ll_get_rx_msg_count(dev);
         for (uint32_t i = 0; i < msg_count; i++)
         {
+            // Counted per frame rather than per interrupt. One RI can carry several
+            // messages, so the old placement under-reported the bus whenever it
+            // mattered most -- under load -- and the line it feeds calls itself
+            // "CAN bus msg/s". Interrupts/s is still there to be compared against it.
+            _cb_count.fetch_add(1, std::memory_order_relaxed);
+
             frame f;
             f.info.u8 = dev->tx_rx_buffer[0].val;
 

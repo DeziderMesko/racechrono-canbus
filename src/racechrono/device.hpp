@@ -24,6 +24,8 @@
 #include "../racechrono-canbus.hpp"
 #include "../utils/timer.hpp"
 
+#include <atomic>
+
 #include <BLE2902.h>
 #include <BLECharacteristic.h>
 #include <BLEDevice.h>
@@ -53,7 +55,18 @@ public:
      */
     __always_inline bool connected() const noexcept
     {
-        return _server->getConnectedCount() > 0;
+        // Null-checked: the display task reads this from the moment it starts, which
+        // is before start() has created the server.
+        return _server != nullptr && _server->getConnectedCount() > 0;
+    }
+
+    /**
+     * @return frames notified to the app since boot. Cumulative, so a caller derives
+     * a rate from its own previous sample -- see canbus::controller::counters_t.
+     */
+    __always_inline uint32_t frames() const noexcept
+    {
+        return _ble_count.load(std::memory_order_relaxed);
     }
 
     /**
@@ -79,7 +92,7 @@ public:
         {
             _canbus_frames->setValue(data, len);
             _canbus_frames->notify();
-            ++_ble_count;
+            _ble_count.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
@@ -120,7 +133,8 @@ private:
         , _2902_desc{}
         , _client_connected(false)
         , _stats_timer{}
-        , _ble_count(0UL)
+        , _ble_count(0U)
+        , _ble_last(0U)
     {
         _2902_desc.setNotifications(true);
     }
@@ -133,7 +147,10 @@ private:
     BLE2902 _2902_desc;
     bool _client_connected;
     utils::timer _stats_timer;
-    unsigned long _ble_count;
+    /// cumulative, never reset: the display reads it too
+    std::atomic<uint32_t> _ble_count;
+    /// what stats() saw last time, so it can print a rate without zeroing the counter
+    uint32_t _ble_last;
 };
 
 } // namespace racechrono

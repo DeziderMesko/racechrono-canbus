@@ -64,6 +64,47 @@ public:
 #endif
 
     /**
+     * A snapshot of the ISR's counters, for anything that wants to report them
+     * without owning them -- the display, primarily.
+     *
+     * Every count here is cumulative and monotonic, so a caller derives a rate by
+     * subtracting its own previous sample. That is the reason stats() no longer
+     * zeroes them: two readers cannot share a counter that either of them resets,
+     * and a DEBUG build has two.
+     */
+    struct counters_t
+    {
+        uint32_t interrupts;  //!< TWAI interrupts serviced
+        uint32_t errors;      //!< error/arbitration/bus-error interrupts
+        uint32_t frames;      //!< frames the ISR read out of the hardware
+        uint32_t forwarded;   //!< frames queued for core 0
+        uint32_t dropped;     //!< frames lost to a full queue
+        uint32_t peak;        //!< deepest the queue has ever been
+        uint32_t extended;    //!< 29-bit frames discarded
+        uint32_t remote;      //!< remote-transmission requests discarded
+        uint32_t queued;      //!< queue depth right now
+        uint32_t capacity;    //!< queue depth it would take to drop a frame
+    };
+
+    /**
+     * read the counters. Not const: the queue depth comes from the queue itself.
+     */
+    counters_t counters() noexcept;
+
+    /**
+     * controller status register (TWAI_LL_STATUS_* bits)
+     */
+    uint32_t status() const noexcept;
+
+    /**
+     * transmit and receive error counters. Both are frozen in listen-only mode,
+     * where the controller neither transmits nor acknowledges, so they are reported
+     * as context rather than read as a health signal -- status() is the health signal.
+     */
+    uint32_t tec() const noexcept;
+    uint32_t rec() const noexcept;
+
+    /**
      * install controller driver
      */
     bool install() noexcept;
@@ -122,6 +163,12 @@ private:
     /// would bury a handful of them.
     std::atomic<uint32_t> _ef_count;
     std::atomic<uint32_t> _rt_count;
+    /// what stats() saw last time, so it can print a delta without zeroing a
+    /// counter the display is also reading
+    uint32_t _ir_last;
+    uint32_t _er_last;
+    uint32_t _cb_last;
+    uint32_t _rc_last;
     intr_handle_t _isr_handle;
     /// frames the queue holds while core 0 is not draining it. At the R9's ~1050
     /// msg/s that is ~1.9 s of bus, and ~0.5 s of a saturated 500 kbps one. Costs

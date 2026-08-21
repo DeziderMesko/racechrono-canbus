@@ -106,7 +106,9 @@ void device::stats() noexcept
 
         if (delta > 0UL)
         {
-            float msg_per_sec = (static_cast<float>(exchange(_ble_count, 0UL)) / static_cast<float>(delta)) * 1e6f;
+            uint32_t total = _ble_count.load(std::memory_order_relaxed);
+            uint32_t count = total - exchange(_ble_last, total);
+            float msg_per_sec = (static_cast<float>(count) / static_cast<float>(delta)) * 1e6f;
             infoln(" Bluetooth LE msg/s: %.2f", msg_per_sec);
         }
     }
