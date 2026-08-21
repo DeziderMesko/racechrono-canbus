@@ -70,7 +70,14 @@ bool device::start(BLECharacteristicCallbacks* callbacks) noexcept
     _pid_requests->setCallbacks(callbacks);
     _canbus_frames = _service->createCharacteristic(can_bus_characteristic_uuid,
         BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+    // On NimBLE this is a no-op that logs a deprecation notice -- the host creates the
+    // 0x2902 descriptor itself for any characteristic with NOTIFY. Kept because a
+    // Bluedroid build still needs it.
     _canbus_frames->addDescriptor(&_2902_desc);
+    // An observer on the frame path that does not change it: onStatus() is the only
+    // place the outcome of a notify() is visible, and onSubscribe() the only place the
+    // app's subscription is.
+    _canbus_frames->setCallbacks(this);
     _service->start();
 
     BLEAdvertising* advertising = BLEDevice::getAdvertising();
@@ -94,7 +101,79 @@ void device::onDisconnect(BLEServer*)
     // once connection is made, BLE stops advertising, so on disconnect, start advertising again..
     infoln("Bluetooth LE client disconnected!");
     _client_connected = false;
+    _conn_interval.store(0U, std::memory_order_relaxed);
+    _mtu.store(0U, std::memory_order_relaxed);
+    _subscribed.store(false, std::memory_order_relaxed);
     BLEDevice::startAdvertising();
+}
+
+#if defined(CONFIG_NIMBLE_ENABLED)
+
+void device::onConnect(BLEServer*, ble_gap_conn_desc* desc)
+{
+    _conn_interval.store(desc->conn_itvl, std::memory_order_relaxed);
+
+    infoln("Bluetooth LE connected: interval %u (%.2f ms) latency %u timeout %u ms",
+        desc->conn_itvl, desc->conn_itvl * 1.25f, desc->conn_latency,
+        desc->supervision_timeout * 10U);
+}
+
+void device::onMtuChanged(BLEServer*, ble_gap_conn_desc*, uint16_t mtu)
+{
+    _mtu.store(mtu, std::memory_order_relaxed);
+    infoln("Bluetooth LE MTU %u", mtu);
+}
+
+void device::onConnParamsUpdate(uint16_t, uint16_t interval, uint16_t latency,
+    uint16_t timeout, uint8_t status)
+{
+    if (status == 0)
+    {
+        _conn_interval.store(interval, std::memory_order_relaxed);
+    }
+
+    // interval is in 1.25 ms units, timeout in 10 ms units. The interval is the number
+    // that decides everything downstream: the radio only speaks at connection events,
+    // so frames per second has a hard ceiling of a few per interval whatever the bus is
+    // doing.
+    infoln("Bluetooth LE conn interval %u (%.2f ms) latency %u timeout %u ms status %u",
+        interval, interval * 1.25f, latency, timeout * 10U, status);
+}
+
+void device::onSubscribe(BLECharacteristic*, ble_gap_conn_desc*, uint16_t sub)
+{
+    // bit 0 is notifications, bit 1 indications; RaceChrono asks for the former
+    bool on = (sub & 0x0001) != 0;
+    _subscribed.store(on, std::memory_order_relaxed);
+    infoln("Bluetooth LE subscribe 0x%04x -> notifications %s", sub, on ? "on" : "off");
+}
+
+#endif // CONFIG_NIMBLE_ENABLED
+
+void device::onStatus(BLECharacteristic*, Status s, uint32_t code)
+{
+    switch (s)
+    {
+    case SUCCESS_NOTIFY:
+        _ble_count.fetch_add(1, std::memory_order_relaxed);
+        break;
+
+    case ERROR_NOTIFY_DISABLED:
+    case ERROR_NO_SUBSCRIBER:
+    case ERROR_NO_CLIENT:
+        // Not congestion: there was nowhere to send it. Counted apart from lost frames
+        // because the fix is on the phone, not on the board.
+        _ble_nosub.fetch_add(1, std::memory_order_relaxed);
+        break;
+
+    default:
+        // ERROR_GATT, and anything the library adds later. ble_gatts_notify_custom()
+        // refuses when the host runs out of mbufs, which is what a link too slow for the
+        // bus looks like from here.
+        _ble_lost.fetch_add(1, std::memory_order_relaxed);
+        _ble_err.store(code, std::memory_order_relaxed);
+        break;
+    }
 }
 
 #if defined(DEBUG)
@@ -110,6 +189,16 @@ void device::stats() noexcept
             uint32_t count = total - exchange(_ble_last, total);
             float msg_per_sec = (static_cast<float>(count) / static_cast<float>(delta)) * 1e6f;
             infoln(" Bluetooth LE msg/s: %.2f", msg_per_sec);
+            infoln(" Bluetooth LE sent: %lu lost: %lu nosub: %lu err: %ld",
+                (unsigned long)total,
+                (unsigned long)_ble_lost.load(std::memory_order_relaxed),
+                (unsigned long)_ble_nosub.load(std::memory_order_relaxed),
+                (long)_ble_err.load(std::memory_order_relaxed));
+            infoln(" Bluetooth LE link: %s sub %s interval %.2f ms mtu %u",
+                connected() ? "up" : "down",
+                subscribed() ? "yes" : "no",
+                _conn_interval.load(std::memory_order_relaxed) * 1.25f,
+                _mtu.load(std::memory_order_relaxed));
         }
     }
 }

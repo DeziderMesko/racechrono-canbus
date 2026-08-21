@@ -48,6 +48,8 @@ Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 constexpr int screen_w = 240;
 constexpr int screen_h = 135;
 constexpr int cols = 40;
+// header is drawn at text size 2, so half as many columns fit across the glass
+constexpr int head_cols = 20;
 constexpr int content_y = 20;
 constexpr int row_h = 11;
 constexpr int rows = 9;
@@ -451,11 +453,43 @@ void display::wipe() noexcept
 void display::refresh() noexcept
 {
     // Header: the one line that is the same on every page, because it answers the
-    // question asked most often -- is the phone actually connected.
+    // question asked most often -- is the phone actually getting anything.
+    //
+    // Three states, not two. A phone that is connected but has not subscribed to the
+    // frame characteristic looks exactly like a working link on the phone, in the
+    // advertising name, and in every other counter here, and receives nothing. It is
+    // the failure worth spending a colour on.
     char head[cache_len];
-    bool ble = RCDEV.connected();
-    snprintf(head, sizeof(head), "bluecan %s", ble ? "BLE " : "adv ");
-    field(0, 2, ble ? ST77XX_GREEN : ST77XX_YELLOW, 0, head);
+    bool up = RCDEV.connected();
+    bool sub = RCDEV.subscribed();
+    const char* state = !up ? "adv" : sub ? "SUB" : "BLE";
+    uint16_t state_c = !up ? ST77XX_YELLOW : sub ? ST77XX_GREEN : ST77XX_RED;
+
+    // Connection interval, in tenths of a millisecond: the link reports it in 1.25 ms
+    // units, and it is the ceiling on everything downstream, since the radio only
+    // speaks at connection events. 7.5 ms is as fast as BLE goes; 30 ms is a phone
+    // that will not keep up with the bus whatever the firmware does.
+    unsigned long tenths = RCDEV.interval() * 125UL / 10UL;
+    int n;
+    if (up && tenths != 0UL)
+    {
+        n = snprintf(head, sizeof(head), "bluecan %s %lu.%lums",
+                     state, tenths / 10UL, tenths % 10UL);
+    }
+    else
+    {
+        n = snprintf(head, sizeof(head), "bluecan %s", state);
+    }
+
+    // field() draws each character over its own background but does not pad, so a
+    // shorter header would leave the tail of a longer one on the glass.
+    for (; n < head_cols && n < static_cast<int>(sizeof(head)) - 1; n++)
+    {
+        head[n] = ' ';
+    }
+    head[n] = '\0';
+
+    field(0, 2, state_c, 0, head);
 
     switch (_page)
     {
@@ -490,8 +524,14 @@ void display::page_bus() noexcept
     row(0, state_color, "CAN 500k LISTEN-ONLY %s", state);
     row(1, ST77XX_WHITE, "rx  %9lu %5lu/s", (unsigned long)c.frames, (unsigned long)_rx_rate);
     row(2, ST77XX_WHITE, "fwd %9lu %5lu/s", (unsigned long)c.forwarded, (unsigned long)_fwd_rate);
-    row(3, RCDEV.connected() ? ST77XX_WHITE : ST77XX_YELLOW,
-        "ble %9lu %5lu/s", (unsigned long)RCDEV.frames(), (unsigned long)_ble_rate);
+    // lost is the BLE half of the drop counter two lines down, and it exists for the
+    // same reason: BLECharacteristic::notify() returns void and logs a refusal at a
+    // level a release build never prints, so a link too slow for the bus would
+    // otherwise lose frames in complete silence.
+    unsigned long ble_lost = RCDEV.lost();
+    row(3, ble_lost ? ST77XX_RED : RCDEV.connected() ? ST77XX_WHITE : ST77XX_YELLOW,
+        "ble %8lu %4lu/s lost %lu",
+        (unsigned long)RCDEV.frames(), (unsigned long)_ble_rate, ble_lost);
     row(4, c.queued > (c.capacity / 2) ? ST77XX_YELLOW : ST77XX_WHITE,
         "queue %4lu peak %4lu/%lu",
         (unsigned long)c.queued, (unsigned long)c.peak, (unsigned long)c.capacity);
