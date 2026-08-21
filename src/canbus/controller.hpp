@@ -115,8 +115,14 @@ private:
     std::atomic<uint32_t> _er_count;
     std::atomic<uint32_t> _cb_count;
     std::atomic<uint32_t> _rc_count;
+    std::atomic<uint32_t> _dr_count;
+    std::atomic<uint32_t> _hw_count;
     intr_handle_t _isr_handle;
-    static constexpr uint32_t _queue_length = 8;
+    /// frames the queue holds while core 0 is not draining it. At the R9's ~1050
+    /// msg/s that is ~1.9 s of bus, and ~0.5 s of a saturated 500 kbps one. Costs
+    /// 2000 * 13 bytes of DRAM. Upstream's 8 was ~8 ms of R9 traffic: any BLE stall
+    /// longer than that dropped frames, silently.
+    static constexpr uint32_t _queue_length = 2000;
     static constexpr uint32_t _queue_item_size = sizeof(canbus::frame);
     uint8_t _queue_storage[_queue_length * _queue_item_size];
     StaticQueue_t _static_queue;

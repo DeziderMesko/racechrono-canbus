@@ -59,6 +59,8 @@ controller::controller() noexcept
     , _er_count(0U)
     , _cb_count(0U)
     , _rc_count(0U)
+    , _dr_count(0U)
+    , _hw_count(0U)
     , _isr_handle(nullptr)
     , _queue_storage{}
     , _static_queue{}
@@ -86,12 +88,18 @@ void controller::stats() noexcept
             uint32_t rc_count = _rc_count.exchange(0UL, std::memory_order_relaxed);
             uint32_t waiting = uxQueueMessagesWaiting(_queue);
             uint32_t available = uxQueueSpacesAvailable(_queue);
+            // these two are cumulative on purpose: a single dropped frame matters,
+            // and the peak is what says whether the queue is big enough
+            uint32_t dr_count = _dr_count.load(std::memory_order_relaxed);
+            uint32_t hw_count = _hw_count.load(std::memory_order_relaxed);
 
             infoln("       Interrupts/s: %.2f", (static_cast<float>(ir_count) / static_cast<float>(delta)) * 1e6f);
             infoln("           Errors/s: %.2f", (static_cast<float>(er_count) / static_cast<float>(delta)) * 1e6f);
             infoln("      CAN bus msg/s: %.2f", (static_cast<float>(cb_count) / static_cast<float>(delta)) * 1e6f);
             infoln("   RaceChrono msg/s: %.2f", (static_cast<float>(rc_count) / static_cast<float>(delta)) * 1e6f);
-            infoln("              Queue: %2u / %2u", waiting, available);
+            infoln("              Queue: %4u / %4u", waiting, available);
+            infoln("         Queue peak: %4u of %4u", hw_count, _queue_length);
+            infoln("     Dropped frames: %4u", dr_count);
         }
     }
 }
@@ -275,8 +283,22 @@ void controller::isr() noexcept
                 f.data.u8[i] = dev->tx_rx_buffer[i+3].val;
             }
 
-            xQueueSendToBackFromISR(_queue, &f, &task_woken);
-            _rc_count.fetch_add(1, std::memory_order_relaxed);
+            // A full queue drops the frame, and upstream ignored that: the counter
+            // was incremented either way, so loss looked like it never happened.
+            if (xQueueSendToBackFromISR(_queue, &f, &task_woken) == pdTRUE)
+            {
+                _rc_count.fetch_add(1, std::memory_order_relaxed);
+
+                uint32_t waiting = uxQueueMessagesWaitingFromISR(_queue);
+                if (waiting > _hw_count.load(std::memory_order_relaxed))
+                {
+                    _hw_count.store(waiting, std::memory_order_relaxed);
+                }
+            }
+            else
+            {
+                _dr_count.fetch_add(1, std::memory_order_relaxed);
+            }
 
             twai_ll_set_cmd_release_rx_buffer(dev);
         }
