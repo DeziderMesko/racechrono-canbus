@@ -178,12 +178,24 @@ bool controller::install() noexcept
     bootln("        TSEG2: %3u", t_config.tseg_2);
     bootln("  3x Sampling: %3s", t_config.triple_sampling == 0 ? "No" : "Yes");
 
-    // Only the RX pin is set up. TX is left unconnected to the peripheral, so the
-    // pin cannot be driven at all - a second, physical layer of listen-only.
+    // Only RX is connected to the peripheral. TX is never routed through the GPIO
+    // matrix, so the controller physically cannot transmit - a second layer of
+    // listen-only that does not depend on a register staying set.
     gpio_set_pull_mode(CAN_RX_PIN, GPIO_FLOATING);
     esp_rom_gpio_connect_in_signal(CAN_RX_PIN, TWAI_RX_IDX, false);
     esp_rom_gpio_pad_select_gpio(CAN_RX_PIN);
     gpio_set_direction(CAN_RX_PIN, GPIO_MODE_INPUT);
+
+    // The TX pad still has to be held recessive. Unconnected, it is high impedance
+    // and the SN65HVD230 holds its D input high with an internal pull-up of only
+    // ~8 uA (~400 kOhm) - specified recessive (SLOS346K table 1, "D open"), but a
+    // thin noise margin on a vehicle harness. A dominant glitch there corrupts a
+    // frame for every node on the bus. Driving the pad replaces 400 kOhm with tens
+    // of ohms. Level before direction, so enabling the driver cannot emit a low.
+    esp_rom_gpio_pad_select_gpio(CAN_TX_PIN);
+    gpio_set_pull_mode(CAN_TX_PIN, GPIO_PULLUP_ONLY);
+    gpio_set_level(CAN_TX_PIN, 1);
+    gpio_set_direction(CAN_TX_PIN, GPIO_MODE_OUTPUT);
     bootln("CAN bus GPIO pins reset...");
 
     // setup interrupt service routine
