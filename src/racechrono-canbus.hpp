@@ -66,6 +66,13 @@
 #define BLE_PWR_LVL ESP_PWR_LVL_P12
 #endif
 
+// Adafruit Feather ESP32-S3 Reverse TFT
+#if defined(ARDUINO_ADAFRUIT_FEATHER_ESP32S3_REVTFT)
+#define CAN_RX_PIN GPIO_NUM_18   // A0
+#define CAN_TX_PIN GPIO_NUM_17   // A1
+#define BLE_PWR_LVL ESP_PWR_LVL_P12
+#endif
+
 // ESP32 Dev Module
 #if defined(ARDUINO_ESP32_DEV)
 #define LED_BUILTIN 13
