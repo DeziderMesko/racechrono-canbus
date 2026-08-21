@@ -41,6 +41,21 @@
 /// statistics timeout in microseconds
 #define CONFIG_RC_STATS_TIMEOUT 5000000
 
+// Connection parameters to request from the phone once it connects, in the units the
+// link layer uses: intervals in 1.25 ms, timeout in 10 ms.
+//
+// The interval is the ceiling on throughput -- the radio only speaks at connection
+// events -- so the R9's ~1050 msg/s wants this as short as it will go. It is not
+// simply set to the 7.5 ms minimum because iOS rejects a request outright unless
+// min >= 15 ms, max >= min + 15 ms, latency <= 30 and timeout <= 6 s, and a rejected
+// request leaves whatever the phone picked on its own. 15-30 ms is legal on both
+// platforms; on an Android-only setup, 6/12 (7.5-15 ms) is worth trying, with the
+// negotiated result read off the display rather than assumed.
+#define CONFIG_BLE_CONN_ITVL_MIN 12   // 15.0 ms
+#define CONFIG_BLE_CONN_ITVL_MAX 24   // 30.0 ms
+#define CONFIG_BLE_CONN_LATENCY  0
+#define CONFIG_BLE_CONN_TIMEOUT  400  // 4 s
+
 /// if DEBUG is defined, logger will be enabled and print to serial console
 // #define DEBUG
 

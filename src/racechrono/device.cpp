@@ -109,13 +109,23 @@ void device::onDisconnect(BLEServer*)
 
 #if defined(CONFIG_NIMBLE_ENABLED)
 
-void device::onConnect(BLEServer*, ble_gap_conn_desc* desc)
+void device::onConnect(BLEServer* server, ble_gap_conn_desc* desc)
 {
     _conn_interval.store(desc->conn_itvl, std::memory_order_relaxed);
 
     infoln("Bluetooth LE connected: interval %u (%.2f ms) latency %u timeout %u ms",
         desc->conn_itvl, desc->conn_itvl * 1.25f, desc->conn_latency,
         desc->supervision_timeout * 10U);
+
+    // Ask for a faster link. The phone has the final say and may ignore the request
+    // outright, so the negotiated value is read back in onConnParamsUpdate() rather
+    // than assumed here.
+    if (!server->requestConnParams(desc->conn_handle,
+            CONFIG_BLE_CONN_ITVL_MIN, CONFIG_BLE_CONN_ITVL_MAX,
+            CONFIG_BLE_CONN_LATENCY, CONFIG_BLE_CONN_TIMEOUT))
+    {
+        warnln("Bluetooth LE connection parameter request refused locally");
+    }
 }
 
 void device::onMtuChanged(BLEServer*, ble_gap_conn_desc*, uint16_t mtu)

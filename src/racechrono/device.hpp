@@ -184,7 +184,7 @@ public:
 
     /**
      * BLE callback carrying the connection descriptor, which is where the initial
-     * connection interval is.
+     * connection interval and the handle a parameter request needs both live.
      */
     void onConnect(BLEServer*, ble_gap_conn_desc* desc) override;
 
