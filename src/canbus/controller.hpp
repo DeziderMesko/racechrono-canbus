@@ -126,8 +126,14 @@ public:
 
     /**
      * receive a frame from the internal buffer
+     *
+     * @param wait ticks to block for when the buffer is empty. 0 polls, which is
+     *        what a task at tskIDLE_PRIORITY can afford because it time-shares the
+     *        core with the idle task anyway. Anything above idle priority must pass
+     *        a wait, or the idle task never runs and
+     *        CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0 turns that into a panic reset.
      */
-    bool recv(frame& f) noexcept;
+    bool recv(frame& f, TickType_t wait = 0) noexcept;
 
 private:
     explicit controller() noexcept;

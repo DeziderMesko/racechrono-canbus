@@ -40,6 +40,13 @@ StackType_t core0_stack[core0_stack_size];
 TaskHandle_t core0_handle;
 volatile bool core0_started = false;
 
+// How long the drain task blocks on an empty frame queue before going round again to
+// let stats() print, and how many frames it forwards before handing core 0 back to the
+// idle task. Both exist because the task no longer runs at tskIDLE_PRIORITY: see the
+// comment on the priority below.
+constexpr TickType_t core0_wait = pdMS_TO_TICKS(20);
+constexpr uint32_t core0_batch = 128U;
+
 void core0(void*);
 
 }
@@ -81,7 +88,18 @@ void setup()
         "racechrono",
         core0_stack_size,
         nullptr,
-        tskIDLE_PRIORITY,
+        // Above the idle task, level with the display task rather than under it.
+        //
+        // At tskIDLE_PRIORITY this task round-robins with core 0's idle task, so it
+        // gets about half of whatever the BLE host leaves, and the display task
+        // preempts it on top of that. Level with the display costs nothing -- the
+        // panel sleeps between repaints -- and stops the idle task taking every
+        // second slice while frames are waiting.
+        //
+        // It is level with, not above, the display on purpose. Under saturation this
+        // task's drain loop stops exiting, and the panel is the only instrument that
+        // still reports while that lasts.
+        tskIDLE_PRIORITY + 1,
         core0_stack,
         &core0_buffer,
         0
@@ -125,9 +143,15 @@ void core0(void*)
     {
         core0_started = true;
 
+        uint32_t drained = 0;
+
         while (true)
         {
-            while (CANCTLR.recv(f))
+            // Blocking, not polling. Above tskIDLE_PRIORITY a spin on an empty queue
+            // would keep core 0's idle task off the CPU forever, and the task watchdog
+            // panics after five seconds of that. The wait only applies when there is
+            // nothing to take, so a busy queue still drains at full speed.
+            while (CANCTLR.recv(f, core0_wait))
             {
 #if defined(DEBUG)
                 uint32_t id = f.id;
@@ -138,6 +162,24 @@ void core0(void*)
                 // After the send, not before: the phone is the product, the census is
                 // the instrument, and the instrument never delays the product.
                 DISP.note(f);
+
+                // A queue that never empties never blocks either, which is the same
+                // watchdog problem by a different route. One tick every 128 frames is
+                // the cheapest way to guarantee the idle task runs -- 1 ms per 128
+                // frames is 0.2% of the core at the rate this link gives up at, and
+                // the queue holds 2000.
+                //
+                // Breaking out afterwards is what lets stats() print at all. It sits
+                // after this loop, and the loop used to stop exiting under load, so
+                // the board went silent exactly when it was worth reading. stats() is
+                // gated on its own 5 s timer and compiled out of a release build, so
+                // reaching it every 128 frames costs a comparison.
+                if (++drained >= core0_batch)
+                {
+                    drained = 0;
+                    vTaskDelay(1);
+                    break;
+                }
             }
             RCDEV.stats();
         }

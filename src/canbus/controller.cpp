@@ -285,9 +285,9 @@ bool controller::stop() noexcept
     return true;
 }
 
-bool controller::recv(frame& f) noexcept
+bool controller::recv(frame& f, TickType_t wait) noexcept
 {
-    return _queue ? xQueueReceive(_queue, &f, 0) == pdTRUE : false;
+    return _queue ? xQueueReceive(_queue, &f, wait) == pdTRUE : false;
 }
 
 void IRAM_ATTR controller::isr(void* arg)
