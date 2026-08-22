@@ -43,8 +43,9 @@ compiles in only for the Reverse TFT.
 
 ### The CAN receive path
 
-- **Frame queue 8 → 2000 entries**, statically allocated. Two seconds of a saturated
-  500 kbps bus, so a stalled radio costs latency instead of frames.
+- **Frame queue 8 → 2000 entries**, statically allocated: ~1.9 s of the R9's ~1050 msg/s,
+  ~0.5 s of a saturated 500 kbps bus, so a stalled radio costs latency instead of frames.
+  Upstream's 8 was about 8 ms of R9 traffic.
 - **A full queue is now a drop, not a delivery.** Upstream incremented the received
   counter whether or not `xQueueSendToBackFromISR()` succeeded, so loss was invisible. The
   ISR now counts drops separately and tracks the queue's high-water mark.
@@ -56,8 +57,11 @@ compiles in only for the Reverse TFT.
 - **The bit-rate prescaler is derived**, not taken from `TWAI_TIMING_CONFIG_*`. On ESP32
   core 3.x those macros stopped carrying a usable `brp` for the S3, which silently put the
   controller at the wrong bit rate.
-- **Listen-only is set through the core 3.x API** and verified by reading the register
-  back, rather than assumed.
+- **Listen-only is set through the core 3.x API**, which takes three flags rather than a
+  `twai_mode_t`, and the behaviour is demonstrated on the bench rather than assumed: the
+  CANable drops to ERROR-PASSIVE with TEC 128 because nothing here ever ACKs it. The mode
+  register is not read back — the registers that were read back, once, are the bit-timing
+  ones.
 - **The TX pad is held recessive** instead of left floating.
 - **DLC is clamped to 8 in the ISR.** The wire can say 9–15; CAN 2.0 requires a receiver to
   treat that as eight bytes, and a bit error in that nibble on a vehicle harness produces
@@ -177,7 +181,7 @@ Pixel 6 running RaceChrono Pro. Rates below are what the CAN ISR counted, not wh
 asked for.
 
 **The BLE link is the ceiling, and it is `BLE_HS_ENOMEM`.** Frames refused by the host, as
-the bus rate rises, at one negotiated connection interval:
+the bus rate rises:
 
 | Bus msg/s | 196 | 321 | 476 | 589 | 718 | 840 | 914 |
 |---|---|---|---|---|---|---|---|
@@ -185,9 +189,15 @@ the bus rate rises, at one negotiated connection interval:
 | refused, after the priority fix | 0 | 0 | 0 | 0.1% | 0.6% | 7.8% | 22% |
 | frames dropped by the queue | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
 
+The two refusal rows are not one experiment: the phone negotiated **15.00 ms** in the
+before-run and **12.50 ms** in the after-run. Android decides that and was not asked to
+change it. It is worth ~20% more connection events a second — some of the difference in
+the table, nowhere near the whole of it.
+
 Going direct to the host instead of through `BLECharacteristic::notify()` halves the
 refusals mid-ramp and thirds them at the end (0.35% vs 0.8% at ~590 msg/s, 12% vs 35% at
-~846) — but it does not move the wall. Every refusal is still the host running out of
+~846) — that pair *was* taken at a single negotiated interval, 15.00 ms, which is what
+makes it an A/B at all — but it does not move the wall. Every refusal is still the host running out of
 mbufs because the radio cannot drain them at the interval the phone chose. Cheaper work
 upstream of a full queue only delays filling it.
 

@@ -59,8 +59,9 @@ constexpr int rows = 9;
 constexpr int footer_y = 122;
 
 /// how often the BUS page is repainted. Five hertz is faster than anyone reads and
-/// nearly free: with nothing changing a pass costs ~280 us, and each character that
-/// does change costs ~650 us on top.
+/// nearly free: with nothing changing a pass costs ~420 us on the panel as it stands
+/// (the ~280 us this used to say was measured on a smaller page), and each character
+/// that does change costs ~650 us on top.
 constexpr uint32_t refresh_bus_ms = 200;
 /// how often the census and frame pages are repainted. Deliberately slower: nearly
 /// every character on them changes every time, so at 5 Hz the LAST page alone would

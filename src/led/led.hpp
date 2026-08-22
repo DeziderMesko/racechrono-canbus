@@ -83,7 +83,7 @@ public:
      * an RMT transaction.
      *
      * Display task only: one WS2812 is 24 bits at 800 kHz, and rmtWrite() blocks for
-     * the ~30 us it takes. That is nothing next to a 280 us idle repaint and it would
+     * the ~30 us it takes. That is nothing next to a ~420 us idle repaint and it would
      * be the whole budget inside the CAN ISR.
      */
     void status(uint8_t r, uint8_t g, uint8_t b) noexcept;
