@@ -267,6 +267,9 @@ private:
     /// the colour each slot was last drawn in, so a hue change is detected even when
     /// every character in the slot happens to be unchanged
     uint16_t _cache_color[cache_slots];
+    /// the column each slot was last drawn at, so a slot whose own text and colour are
+    /// unchanged still redraws when an earlier slot on the same row shifts it sideways
+    int _cache_col[cache_slots];
     /// next free slot in pool B (see slot_dynamic_base), reset at the top of every
     /// refresh()
     int _slot;

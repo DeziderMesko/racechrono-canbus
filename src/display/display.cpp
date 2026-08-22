@@ -230,6 +230,7 @@ display::display() noexcept
     , _stats_timer{}
     , _cache{}
     , _cache_color{}
+    , _cache_col{}
     , _slot(0)
 {
 }
@@ -701,15 +702,21 @@ void display::field(int y, uint8_t size, uint16_t color, int slot, const char* t
     // here, because the line that reports the repaint cost changes on every pass and
     // would then be paying 24 ms to report that it had paid 24 ms.
     //
-    // A length change or a colour change forces the whole slot to redraw. Length,
-    // because a differently-shaped line (or the sentinel wipe() leaves behind) cannot
-    // be diffed character-by-character. Colour, because two draws can share every
-    // character at some position while wanting a different hue there -- e.g. the
-    // header's "bluecan " prefix is identical whether the state word after it is
-    // "SUB" or "BLE" -- and a plain character diff would then skip repainting
+    // A length change, a colour change or a column change forces the whole slot to
+    // redraw. Length, because a differently-shaped line (or the sentinel wipe() leaves
+    // behind) cannot be diffed character-by-character. Colour, because two draws can
+    // share every character at some position while wanting a different hue there --
+    // e.g. the header's "bluecan " prefix is identical whether the state word after it
+    // is "SUB" or "BLE" -- and a plain character diff would then skip repainting
     // characters that are still showing the previous call's colour, leaving the line
-    // part one hue and part the other.
-    bool whole = strlen(cache) != len || _cache_color[slot] != color;
+    // part one hue and part the other. Column, because seg()/seg_fill() chain several
+    // slots left to right on one row: if an earlier slot's text changes width (the
+    // census's _min_heap starts at a sentinel and shrinks hugely on the first sample,
+    // for instance), every slot after it is asked to draw at a new column even though
+    // its own text did not change -- and a plain diff would then skip it, leaving that
+    // slot's glyphs stranded at the old column, overlapping whatever is now drawn
+    // before it.
+    bool whole = strlen(cache) != len || _cache_color[slot] != color || _cache_col[slot] != col;
 
     for (size_t i = 0; i < len; )
     {
@@ -737,6 +744,7 @@ void display::field(int y, uint8_t size, uint16_t color, int slot, const char* t
     memcpy(cache, text, len);
     cache[len] = '\0';
     _cache_color[slot] = color;
+    _cache_col[slot] = col;
 }
 
 void display::row(int idx, uint16_t color, const char* fmt, ...) noexcept
@@ -829,6 +837,7 @@ void display::wipe() noexcept
         _cache[i][0] = '\x01';
         _cache[i][1] = '\0';
         _cache_color[i] = ST77XX_BLACK;
+        _cache_col[i] = -1;
     }
 }
 
@@ -976,37 +985,40 @@ void display::page_bus() noexcept
     // lost is the BLE half of the drop counter two lines down, and it exists for the
     // same reason: BLECharacteristic::notify() returns void and logs a refusal at a
     // level a release build never prints, so a link too slow for the bus would
-    // otherwise lose frames in complete silence.
+    // otherwise lose frames in complete silence. It can run into the thousands over a
+    // long session, which is why it is the last thing on this row -- nothing after it
+    // has to hold a column steady while it grows.
     unsigned long ble_lost = RCDEV.lost();
-    // peers should never exceed one. The frame path notifies once per subscriber, so a
-    // second connection doubles the BLE traffic for the same bus while every other
-    // counter here keeps looking healthy.
-    unsigned long peers = RCDEV.peers();
-    // This row stays the wordmark's light blue rather than yellow/white, on request --
-    // it is the BLE identity line, not a generic counter row -- but a real fault
-    // (a dropped notify, or a second subscriber) still overrides it with red, and a
-    // link that is not even connected still shows yellow, same as before the split.
-    bool connected = RCDEV.connected();
-
+    // This row's label stays the wordmark's light blue rather than yellow, on
+    // request -- it is the BLE identity line, not a generic counter row -- but its
+    // values are plain white like every other row's, with red reserved for lost
+    // actually being nonzero.
     col = 0;
     y = content_y + 3 * row_h;
     seg(y, col, ST77XX_CYAN, "%-*s", label_w, "ble");
     // Same %9lu/%5lu widths as rx/fwd above -- this used to be %8lu/%4lu, one column
     // narrower, which is exactly what put this row's own value one column to the left
     // of theirs.
-    seg(y, col, connected ? ST77XX_CYAN : ST77XX_YELLOW,
-        "%9lu %5lu/s", (unsigned long)RCDEV.frames(), (unsigned long)_ble_rate);
+    seg(y, col, ST77XX_WHITE, "%9lu %5lu/s", (unsigned long)RCDEV.frames(), (unsigned long)_ble_rate);
     seg(y, col, ST77XX_CYAN, " lost");
-    seg(y, col, ble_lost ? ST77XX_RED : ST77XX_CYAN, " %lu", ble_lost);
-    seg(y, col, ST77XX_CYAN, " p");
-    seg_fill(y, col, peers > 1 ? ST77XX_RED : ST77XX_CYAN, "%lu", peers);
+    seg_fill(y, col, ble_lost ? ST77XX_RED : ST77XX_WHITE, " %lu", ble_lost);
+
+    // peers should never exceed one. The frame path notifies once per subscriber, so a
+    // second connection doubles the BLE traffic for the same bus while every other
+    // counter here keeps looking healthy. It lives on the queue row rather than the
+    // ble row above: that freed the columns lost needed to grow into the thousands
+    // without crowding anything else off the edge, and queue is at least the same
+    // kind of thing -- both are "how much of this link's capacity is in use".
+    unsigned long peers = RCDEV.peers();
 
     col = 0;
     y = content_y + 4 * row_h;
     seg(y, col, ST77XX_YELLOW, "%-*s", label_w, "queue");
     seg(y, col, c.queued > (c.capacity / 2) ? ST77XX_YELLOW : ST77XX_WHITE, "%4lu", (unsigned long)c.queued);
     seg(y, col, ST77XX_YELLOW, " peak");
-    seg_fill(y, col, ST77XX_WHITE, " %4lu/%lu", (unsigned long)c.peak, (unsigned long)c.capacity);
+    seg(y, col, ST77XX_WHITE, " %4lu/%lu", (unsigned long)c.peak, (unsigned long)c.capacity);
+    seg(y, col, ST77XX_YELLOW, " peer");
+    seg_fill(y, col, peers > 1 ? ST77XX_RED : ST77XX_WHITE, " %lu", peers);
 
     // The line that matters most and is easiest to miss. A dropped frame is silent
     // everywhere else: the bus shows no error, because the loss was ours.
@@ -1037,16 +1049,18 @@ void display::page_bus() noexcept
 
     UBaseType_t stack = _handle ? uxTaskGetStackHighWaterMark(_handle) : 0;
 
-    // Two spaces before "min" and "stk" rather than one -- this is the busiest row on
-    // the page (three label/value pairs in 40 columns) and the tighter spacing read
-    // as a run-on: "min 147k303k 1872" rather than three distinguishable fields.
+    // "free", not "heap" -- "heap" reads as the size of an allocation, not as how much
+    // of it is left. "disp stck" instead of "stk" so it can't be misread as anything
+    // to do with the bike. Two spaces before each, not one: this is the busiest row on
+    // the page (three label/value pairs in 40 columns) and the tighter spacing used to
+    // read as a run-on rather than three distinguishable fields.
     col = 0;
     y = content_y + 7 * row_h;
-    seg(y, col, ST77XX_YELLOW, "%-*s", label_w, "heap");
+    seg(y, col, ST77XX_YELLOW, "%-*s", label_w, "free");
     seg(y, col, ST77XX_WHITE, "%luk", (unsigned long)(ESP.getFreeHeap() / 1024));
     seg(y, col, ST77XX_YELLOW, "  min");
     seg(y, col, ST77XX_WHITE, " %luk", (unsigned long)(_min_heap / 1024));
-    seg(y, col, ST77XX_YELLOW, "  stk");
+    seg(y, col, ST77XX_YELLOW, "  disp stck");
     seg_fill(y, col, ST77XX_WHITE, " %lu", (unsigned long)stack);
 
     // What a repaint costs, on the glass it costs it on. A full repaint of this panel
@@ -1068,8 +1082,18 @@ void display::page_bus() noexcept
     seg(y, col, ST77XX_WHITE, "%lu.%lums", draw_shown_ds / 10UL, draw_shown_ds % 10UL);
     seg(y, col, ST77XX_YELLOW, " max");
     seg(y, col, ST77XX_WHITE, " %lu.%lums", draw_max_ds / 10UL, draw_max_ds % 10UL);
-    seg(y, col, ST77XX_YELLOW, " up");
-    seg_fill(y, col, ST77XX_WHITE, " %lu:%02lu", up_m, up_sec);
+
+    // "up" is anchored at a fixed column instead of following on from max's value,
+    // because draw/max's rendered width changes (more digits once a repaint spikes),
+    // and chasing that with a running column is what let a shrinking value strand "up"
+    // wherever it last was -- see the column-change comment on field(). Column 30
+    // leaves room for "up " plus "%3lu:%02lu" (999:59, as far as an uptime is expected
+    // to run) out to column 39 with none to spare, and margin below it for draw and
+    // max to have grown before "up" starts.
+    constexpr int up_col = 30;
+    col = up_col;
+    seg(y, col, ST77XX_YELLOW, "up ");
+    seg_fill(y, col, ST77XX_WHITE, "%3lu:%02lu", up_m, up_sec);
 }
 
 void display::page_ids() noexcept
@@ -1187,6 +1211,7 @@ display::display() noexcept
     , _stats_timer{}
     , _cache{}
     , _cache_color{}
+    , _cache_col{}
     , _slot(0)
 {
 }
