@@ -22,6 +22,7 @@
 #include "../racechrono-canbus.hpp"
 
 #include "../canbus/controller.hpp"
+#include "../canbus/decoder.hpp"
 #include "../logging/logging.hpp"
 #include "../racechrono/device.hpp"
 
@@ -530,7 +531,29 @@ void display::page_bus() noexcept
 
     row(0, state_color, "CAN 500k LISTEN-ONLY %s", state);
     row(1, ST77XX_WHITE, "rx  %9lu %5lu/s", (unsigned long)c.frames, (unsigned long)_rx_rate);
-    row(2, ST77XX_WHITE, "fwd %9lu %5lu/s", (unsigned long)c.forwarded, (unsigned long)_fwd_rate);
+    // What the app asked for, next to what it got. The IDS page says which ids crossed
+    // the filter, but not whether the board is filtering at all -- and "the phone never
+    // sent its allow-list" and "the phone asked for three ids" look identical from
+    // every other counter on this panel. ALL is the boot state and the bench state.
+    int flt = CANDEC.filter_size();
+    // An allow-list too small for what the app asked for means a channel the rider
+    // defined never arrives, and every other counter here would look healthy while it
+    // happened. It cannot fit its own line, so it takes a character.
+    uint32_t flt_over = CANDEC.filter_overflow();
+    char flt_txt[8];
+    if (flt < 0)
+    {
+        snprintf(flt_txt, sizeof(flt_txt), "ALL");
+    }
+    else
+    {
+        snprintf(flt_txt, sizeof(flt_txt), "%d%s", flt, flt_over ? "!" : "");
+    }
+    row(2, flt_over          ? ST77XX_RED
+         : flt == 0          ? ST77XX_YELLOW
+                             : ST77XX_WHITE,
+        "fwd %9lu %5lu/s flt %s",
+        (unsigned long)c.forwarded, (unsigned long)_fwd_rate, flt_txt);
     // lost is the BLE half of the drop counter two lines down, and it exists for the
     // same reason: BLECharacteristic::notify() returns void and logs a refusal at a
     // level a release build never prints, so a link too slow for the bus would

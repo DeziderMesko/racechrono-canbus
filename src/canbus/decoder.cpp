@@ -86,22 +86,54 @@ void decoder::deny_all() noexcept
     }
 }
 
-void decoder::allow_all() noexcept
+void decoder::allow_all(uint16_t interval_ms) noexcept
 {
+    // The interval is deliberately dropped here. A decoder with a static id table
+    // states its own per-id rates, measured against that vehicle's bus, and those are
+    // better information than a phone's request -- see decoder_bmwg8x. A decoder whose
+    // ids are not known ahead of time has nothing to fall back on and must honour it;
+    // decoder_yamahar9 overrides this for exactly that reason.
+    (void) interval_ms;
+
     for (size_t i = 0; i < size(); i++)
     {
         _ids[i].rate = rate(_ids[i].id);
     }
 }
 
-void decoder::allow_id(uint32_t id) noexcept
+void decoder::allow_id(uint32_t id, uint16_t interval_ms) noexcept
 {
+    (void) interval_ms;
+
     auto entry = find(id);
 
     if (entry != end())
     {
         entry->rate = rate(id);
     }
+}
+
+int decoder::filter_size() const noexcept
+{
+    // The static table is the filter, but a deny-all zeroes every rate in it without
+    // shrinking it, so counting the table would report ids as allowed while nothing
+    // was being forwarded. Count what is actually enabled.
+    int enabled = 0;
+
+    for (size_t i = 0; i < _size; i++)
+    {
+        if (_ids[i].rate != rate_disabled)
+        {
+            enabled++;
+        }
+    }
+
+    return enabled;
+}
+
+uint32_t decoder::filter_overflow() const noexcept
+{
+    return 0U;
 }
 
 void decoder::onWrite(BLECharacteristic* characteristic)
@@ -119,7 +151,6 @@ void decoder::onWrite(BLECharacteristic* characteristic)
 
     debugln("ID request CMD %u LEN %u", command, len);
 
-    // NOTE: currently ignoring notify interval from RaceChrono app
     switch (command)
     {
         case 0:
@@ -134,7 +165,7 @@ void decoder::onWrite(BLECharacteristic* characteristic)
             {
                 uint16_t notifyIntervalMs = data[1] << 8 | data[2];
                 verboseln("ID request ALLOW all INTERVAL %u ms", notifyIntervalMs);
-                allow_all();
+                allow_all(notifyIntervalMs);
             }
             break;
         case 2:
@@ -142,8 +173,8 @@ void decoder::onWrite(BLECharacteristic* characteristic)
             {
                 uint16_t notifyIntervalMs = data[1] << 8 | data[2];
                 uint32_t id = data[3] << 24 | data[4] << 16 | data[5] << 8 | data[6];
-                verboseln("ID request ALLOW ID %u INTERVAL %u ms", id, notifyIntervalMs);
-                allow_id(id);
+                verboseln("ID request ALLOW ID 0x%03x INTERVAL %u ms", id, notifyIntervalMs);
+                allow_id(id, notifyIntervalMs);
             }
             break;
         default:

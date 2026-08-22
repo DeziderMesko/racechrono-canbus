@@ -20,8 +20,11 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 #include "../racechrono-canbus.hpp"
+#include "../logging/logging.hpp"
 
 #include <atomic>
+
+#include <esp_timer.h>
 
 #include "decoder.hpp"
 
@@ -31,30 +34,52 @@ namespace canbus
 /**
  * decoder for the Yamaha R9 (2026).
  *
- * There is nothing to decode yet: no CAN ID on this bike is confirmed, so this
- * decoder deliberately has no ID table and no allow-list. Every standard frame the
- * controller receives is forwarded raw to RaceChrono, which decodes channels
- * app-side from CAN ID + bit offset + length + equation.
+ * No CAN id on this bike is confirmed, so unlike decoder_bmwg8x this decoder has no
+ * static id table and no per-id rates of its own. What it has instead is an allow-list
+ * filled in at run time from RaceChrono's own requests: the app sends a deny-all and
+ * then one allow per id it has a channel for, each with the notify interval it wants
+ * that id at. Both are honoured here.
  *
- * That is affordable: the R1-family bus carries roughly sixteen arbitration IDs at
- * about 1050 msg/s in total, well inside what the ESP32-S3 and the BLE link handle -
- * the bench measured 3.2 M frames over an hour at ~850/s with none lost.
+ * Honouring them is what makes the BLE link's ceiling stop mattering. The link starts
+ * refusing frames somewhere around 590 msg/s against the R9's ~1050 (see
+ * motocan/bluecan/README.md), but a handful of allowed ids at the intervals a phone
+ * asks for is tens of messages a second, not a thousand. The ids the app never asked
+ * for are dropped in the CAN ISR, before they cost a queue slot or an mbuf.
  *
- * RaceChrono still drives the stream over its allow/deny protocol, and that is
- * honoured coarsely: a deny-all stops the forwarding, any allow request - whether
- * for one ID or for all of them - starts it again. Sending the app a few IDs it did
- * not ask for costs nothing, since it ignores IDs it has no channel for, and it is
- * what makes the device usable as a sniffer before the mapping table has a single
- * confirmed row.
+ * Two things are deliberately *not* done:
  *
- * Once ../canbus-mapping.md has confirmed IDs, a real table with per-ID rates
- * belongs here, modelled on decoder_bmwg8x.
+ * - **Until an app says otherwise, everything is forwarded.** That is the boot state,
+ *   it is what makes the board usable as a bench sniffer with no phone in the room,
+ *   and it is what every measurement in bluecan/ was taken against. A deny-by-default
+ *   would have quietly changed what those tools measure.
+ *
+ * - **An allow-all request is not rate-limited.** There is no per-id slot to hold a
+ *   timestamp for an id nobody has named, and learning ids inside the ISR would mean
+ *   writing this table from two contexts at once. Allow-all is the sniffer case
+ *   anyway; the interval it carries is read, logged and then ignored.
+ *
+ * Once motocan/canbus-mapping.md has confirmed ids, a static table with measured
+ * per-id rates could live here as well, modelled on decoder_bmwg8x -- but the app's
+ * request would still be the thing that decides what crosses the radio.
  */
 class decoder_yamahar9
     : public decoder
 {
     CPP_NOCOPY(decoder_yamahar9);
     CPP_NOMOVE(decoder_yamahar9);
+
+    /// One allowed id. RaceChrono asks for the ids it has channels for, so this is
+    /// sized off the bus rather than off the protocol: the R1-family bus carries about
+    /// sixteen arbitration ids in total (motocan/canbus-mapping.md), and a phone
+    /// cannot usefully ask for more ids than the bike broadcasts.
+    struct slot
+    {
+        uint32_t id;           ///< arbitration id, written by the BLE task
+        uint32_t interval_us;  ///< 0 means every frame, written by the BLE task
+        int64_t  last_us;      ///< last frame forwarded, written by the ISR only
+    };
+
+    static constexpr size_t max_slots = 32;
 
 public:
     static decoder_yamahar9& get() noexcept
@@ -74,47 +99,152 @@ public:
 
     twai_filter_config_t filter() const noexcept override
     {
-        // no hardware filter: which IDs matter is exactly what is unknown
+        // No hardware filter. It is configured once in controller::install(), long
+        // before the app connects and says what it wants, and its code/mask pair
+        // cannot express an arbitrary set of ids in any case. The allow-list below
+        // does the job a few instructions later, in the same ISR.
         return TWAI_FILTER_CONFIG_ACCEPT_ALL();
     }
 
-    /// called from the CAN ISR for every received frame
-    bool should_decode(uint32_t) noexcept override
+    /**
+     * called from the CAN ISR for every standard frame received.
+     *
+     * No allocation and no blocking lock: a linear scan of at most max_slots aligned
+     * comparisons, and at most one systimer read. esp_timer_get_time() is safe here --
+     * it is in IRAM and reads a counter register.
+     */
+    bool should_decode(uint32_t id) noexcept override
     {
-        return _forward.load(std::memory_order_relaxed);
+        if (_allow_all.load(std::memory_order_relaxed))
+        {
+            return true;
+        }
+
+        // acquire against the release store in allow_id(): a slot is only visible
+        // once every one of its fields has been written.
+        const size_t count = _count.load(std::memory_order_acquire);
+
+        for (size_t i = 0; i < count; i++)
+        {
+            slot& s = _slots[i];
+
+            if (s.id != id)
+            {
+                continue;
+            }
+
+            if (s.interval_us == 0U)
+            {
+                return true;
+            }
+
+            const int64_t now = esp_timer_get_time();
+
+            // >= rather than >, so an interval the bus happens to land exactly on is
+            // forwarded rather than held back a whole period.
+            if (now - s.last_us >= static_cast<int64_t>(s.interval_us))
+            {
+                s.last_us = now;
+                return true;
+            }
+
+            return false;
+        }
+
+        return false;
+    }
+
+    int filter_size() const noexcept override
+    {
+        if (_allow_all.load(std::memory_order_relaxed))
+        {
+            return -1;
+        }
+
+        return static_cast<int>(_count.load(std::memory_order_relaxed));
+    }
+
+    uint32_t filter_overflow() const noexcept override
+    {
+        return _overflow.load(std::memory_order_relaxed);
     }
 
 protected:
     uint16_t rate(uint32_t) const noexcept override
     {
+        // the base class's frame-count divider is unused here: this decoder gates on
+        // elapsed time instead, because the app states its wish in milliseconds and
+        // the native rate of an id on this bike is exactly what is not known yet.
         return rate_default;
     }
 
     void deny_all() noexcept override
     {
-        _forward.store(false, std::memory_order_relaxed);
+        _allow_all.store(false, std::memory_order_relaxed);
+        // Emptying the list is one release store. A concurrent ISR either sees the old
+        // count and forwards one more frame, or sees zero and forwards none; both are
+        // correct answers to a deny that arrived mid-frame.
+        _count.store(0U, std::memory_order_release);
     }
 
-    void allow_all() noexcept override
+    void allow_all(uint16_t interval_ms) noexcept override
     {
-        _forward.store(true, std::memory_order_relaxed);
+        // read and logged by the caller, then ignored on purpose -- see the class
+        // comment. There is nowhere to keep a timestamp for an id nobody has named.
+        (void) interval_ms;
+        _allow_all.store(true, std::memory_order_relaxed);
     }
 
-    void allow_id(uint32_t) noexcept override
+    void allow_id(uint32_t id, uint16_t interval_ms) noexcept override
     {
-        // no allow-list: any request from the app opens the whole bus
-        _forward.store(true, std::memory_order_relaxed);
+        const uint32_t interval_us = static_cast<uint32_t>(interval_ms) * 1000U;
+        const size_t count = _count.load(std::memory_order_relaxed);
+
+        // already listed: update the interval in place. The ISR reading the old value
+        // for one more frame is not worth ordering against.
+        for (size_t i = 0; i < count; i++)
+        {
+            if (_slots[i].id == id)
+            {
+                _slots[i].interval_us = interval_us;
+                return;
+            }
+        }
+
+        if (count >= max_slots)
+        {
+            // Counted, not just logged. A release build has no console, and an id the
+            // rider defined a channel for that silently never arrives is the worst
+            // possible way for this to fail.
+            _overflow.fetch_add(1, std::memory_order_relaxed);
+            warnln("ID request ALLOW ID 0x%03x DROPPED, allow-list full (%u)", id, max_slots);
+            return;
+        }
+
+        _slots[count].id = id;
+        _slots[count].interval_us = interval_us;
+        _slots[count].last_us = 0;
+
+        // Publish last, and with release ordering: the ISR must never see a slot whose
+        // id is set but whose interval still holds whatever was there before.
+        _count.store(count + 1U, std::memory_order_release);
     }
 
 private:
     explicit decoder_yamahar9() noexcept
         : decoder(0)
-        , _forward(true)
+        , _slots{}
+        , _count(0U)
+        , _allow_all(true)
+        , _overflow(0U)
     {
     }
 
     /// written by the BLE task, read by the CAN ISR
-    std::atomic<bool> _forward;
+    slot _slots[max_slots];
+    std::atomic<size_t> _count;
+    std::atomic<bool> _allow_all;
+    std::atomic<uint32_t> _overflow;
 };
 
 } // namespace canbus

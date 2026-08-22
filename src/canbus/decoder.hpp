@@ -114,14 +114,38 @@ public:
      */
     virtual bool should_decode(uint32_t id) noexcept;
 
+    /**
+     * what the allow-list currently holds, for the panel. A decoder that forwards
+     * everything regardless of what the app asked for reports -1: the difference
+     * between "nothing is allowed" and "everything is" is exactly what a reader
+     * standing in front of the board needs and cannot otherwise see.
+     * @return number of allowed ids, or -1 when every id is forwarded
+     */
+    virtual int filter_size() const noexcept;
+
+    /**
+     * allow requests that did not fit in the allow-list, cumulative. A decoder with a
+     * static table cannot overflow and reports 0.
+     * @return number of ids the app asked for and did not get
+     */
+    virtual uint32_t filter_overflow() const noexcept;
+
 protected:
     explicit decoder(size_t size) noexcept;
 
     virtual void deny_all() noexcept;
 
-    virtual void allow_all() noexcept;
+    /**
+     * allow every id this decoder knows about. \p interval_ms is the notify interval
+     * RaceChrono asked for, in milliseconds, where 0 means "as fast as the bus offers".
+     */
+    virtual void allow_all(uint16_t interval_ms) noexcept;
 
-    virtual void allow_id(uint32_t id) noexcept;
+    /**
+     * allow one \p id at the notify interval RaceChrono asked for. \p interval_ms is
+     * in milliseconds, where 0 means "as fast as the bus offers".
+     */
+    virtual void allow_id(uint32_t id, uint16_t interval_ms) noexcept;
 
     virtual uint16_t rate(uint32_t id) const noexcept = 0;
 
