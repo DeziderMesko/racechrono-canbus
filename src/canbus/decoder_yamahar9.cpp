@@ -181,6 +181,12 @@ protected:
     void deny_all() noexcept override
     {
         _allow_all.store(false, std::memory_order_relaxed);
+        // The overflow count describes the list that is being thrown away, so it goes
+        // with it. Left standing it would mark every later session -- the panel drawing
+        // "flt 3!" in red and the fault latch re-arming every second -- for a channel
+        // that fits and is not being dropped. The fault itself stays latched from the
+        // moment it was first seen, which is the part that is meant to survive.
+        _overflow.store(0U, std::memory_order_relaxed);
         // Emptying the list is one release store. A concurrent ISR either sees the old
         // count and forwards one more frame, or sees zero and forwards none; both are
         // correct answers to a deny that arrived mid-frame.

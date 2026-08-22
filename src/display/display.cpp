@@ -737,6 +737,14 @@ void display::update_status_led() noexcept
 
 void display::field(int y, uint8_t size, uint16_t color, int slot, const char* text, int col) noexcept
 {
+    // Every drawable line comes through here, so this is the one place the slot pools
+    // can be checked at all. Pool B's counter just increments -- a page that grows a
+    // few segments walks off the end of _cache and memcpys into _cache_color,
+    // _cache_col and _slot, which corrupts the change detection rather than failing
+    // where anyone would look. An abort on the first repaint is the cheaper way to
+    // find that out.
+    RCASSERT(slot >= 0 && slot < cache_slots);
+
     char* cache = _cache[slot];
 
     size_t len = strlen(text);

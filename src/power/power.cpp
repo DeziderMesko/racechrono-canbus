@@ -197,7 +197,15 @@ void gauge::sample() noexcept
     // 1/256 % per LSB, kept in tenths
     _soc = static_cast<uint16_t>((static_cast<uint32_t>(soc) * 10U) >> 8);
     // 0.208 %/hr per LSB, signed, kept in tenths
-    _rate = static_cast<int16_t>((static_cast<int32_t>(static_cast<int16_t>(crate)) * 208) / 100);
+    // Clamped before it narrows: 0.208 %/hr per LSB times a full-scale register is
+    // ~6800 %/hr, which does not fit an int16_t of tenths, and the wrap turns a
+    // maximum discharge into a confident-looking charge. Real rates are three orders
+    // of magnitude below this, so the clamp only ever fires on a garbage read -- which
+    // is exactly when a sign that lies is worst.
+    int32_t rate = (static_cast<int32_t>(static_cast<int16_t>(crate)) * 208) / 100;
+    if (rate > INT16_MAX) { rate = INT16_MAX; }
+    if (rate < INT16_MIN) { rate = INT16_MIN; }
+    _rate = static_cast<int16_t>(rate);
 }
 
 #else // !CONFIG_FUEL_GAUGE
