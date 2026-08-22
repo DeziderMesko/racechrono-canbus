@@ -131,12 +131,26 @@ private:
     void report_status_led() noexcept {}
 #endif
 
-    /// draw one line, but only if its text differs from what is already on the glass
-    void field(int y, uint8_t size, uint16_t color, int slot, const char* text) noexcept;
+    /// draw one line, but only if its text or its colour differs from what is already
+    /// on the glass -- a colour change with no character change still has to redraw,
+    /// or a row that keeps its digits but changes hue leaves the old hue behind on
+    /// every digit that happened not to change that pass
+    void field(int y, uint8_t size, uint16_t color, int slot, const char* text, int col = 0) noexcept;
     /// format one content row, space-padded to the full width so the previous line
     /// cannot leave a tail behind: text is drawn over its own background, and only
     /// the cells a character occupies get repainted
     void row(int idx, uint16_t color, const char* fmt, ...) noexcept __attribute__((format(printf, 4, 5)));
+    /// draw one coloured segment of a row at column *col*, sized for content rows
+    /// (text size 1), and advance *col* past it. Used to give a row's label and its
+    /// value different colours without hand-assigning a cache slot to each one: the
+    /// slot is whichever one is next in _slot, which is reset to the same starting
+    /// value at the top of every refresh() -- so as long as a page draws its segments
+    /// in the same order every pass, each one lands on the same slot every time.
+    void seg(int y, int& col, uint16_t color, const char* fmt, ...) noexcept __attribute__((format(printf, 5, 6)));
+    /// like seg(), but pads its text with spaces out to column *cols* first. For the
+    /// last segment on a row, so a value that shrinks cannot leave the previous,
+    /// longer value's tail on the glass.
+    void seg_fill(int y, int& col, uint16_t color, const char* fmt, ...) noexcept __attribute__((format(printf, 5, 6)));
     /// blank the content area and invalidate every cache slot
     void wipe() noexcept;
 
@@ -171,8 +185,17 @@ private:
     static constexpr int id_slots = 20;
     /// recent frames kept for the LAST page
     static constexpr int ring_slots = 6;
-    /// change-detection cache: one entry per drawable line
-    static constexpr int cache_slots = 14;
+    /// change-detection cache: one entry per drawable line, split into two pools.
+    /// Slots 1..9 and cache_slots-1 are hand-assigned to page_ids(), page_last() and
+    /// the footer, which each draw one colour per line and can keep a fixed slot per
+    /// row. Slots from slot_dynamic_base up are page_bus() and the header's pool:
+    /// those rows mix a yellow label with a white or status-coloured value, so they
+    /// are built from a variable number of seg()/seg_fill() calls instead, each
+    /// claiming the next free slot in _slot. That counter resets to slot_dynamic_base
+    /// at the top of every refresh(), so a pool-B slot is stable across repaints only
+    /// because the sequence of seg() calls that produces it never changes shape.
+    static constexpr int slot_dynamic_base = 20;
+    static constexpr int cache_slots = 70;
     static constexpr int cache_len = 44;
 
     // --- written by the drain task, read by the display task. Both live on core 0
@@ -241,6 +264,12 @@ private:
     utils::timer _stats_timer;
 
     char _cache[cache_slots][cache_len];
+    /// the colour each slot was last drawn in, so a hue change is detected even when
+    /// every character in the slot happens to be unchanged
+    uint16_t _cache_color[cache_slots];
+    /// next free slot in pool B (see slot_dynamic_base), reset at the top of every
+    /// refresh()
+    int _slot;
 };
 
 } // namespace ui

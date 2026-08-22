@@ -89,6 +89,11 @@ const char* bus_state(uint32_t status)
     return "RUN";
 }
 
+/// the "bluecan" wordmark's colour. Darker than ST77XX_BLUE (0x001F), which at full
+/// saturation reads closer to electric blue than the calmer navy the name is meant
+/// to evoke sitting next to a white or yellow status word.
+constexpr uint16_t color_blue_dim = 0x1A96;
+
 #if defined(CONFIG_STATUS_LED)
 
 /// how long the forwarded rate must read zero before the light calls it stopped
@@ -224,6 +229,8 @@ display::display() noexcept
     , _rate_ms(0U)
     , _stats_timer{}
     , _cache{}
+    , _cache_color{}
+    , _slot(0)
 {
 }
 
@@ -677,7 +684,7 @@ void display::update_status_led() noexcept
 #endif
 }
 
-void display::field(int y, uint8_t size, uint16_t color, int slot, const char* text) noexcept
+void display::field(int y, uint8_t size, uint16_t color, int slot, const char* text, int col) noexcept
 {
     char* cache = _cache[slot];
 
@@ -694,9 +701,15 @@ void display::field(int y, uint8_t size, uint16_t color, int slot, const char* t
     // here, because the line that reports the repaint cost changes on every pass and
     // would then be paying 24 ms to report that it had paid 24 ms.
     //
-    // A length change means a differently-shaped line, and after wipe() the cache
-    // holds a sentinel: either way, redraw all of it.
-    bool whole = strlen(cache) != len;
+    // A length change or a colour change forces the whole slot to redraw. Length,
+    // because a differently-shaped line (or the sentinel wipe() leaves behind) cannot
+    // be diffed character-by-character. Colour, because two draws can share every
+    // character at some position while wanting a different hue there -- e.g. the
+    // header's "bluecan " prefix is identical whether the state word after it is
+    // "SUB" or "BLE" -- and a plain character diff would then skip repainting
+    // characters that are still showing the previous call's colour, leaving the line
+    // part one hue and part the other.
+    bool whole = strlen(cache) != len || _cache_color[slot] != color;
 
     for (size_t i = 0; i < len; )
     {
@@ -714,7 +727,7 @@ void display::field(int y, uint8_t size, uint16_t color, int slot, const char* t
 
         tft.setTextSize(size);
         tft.setTextColor(color, ST77XX_BLACK);
-        tft.setCursor(static_cast<int16_t>(i * 6 * size), y);
+        tft.setCursor(static_cast<int16_t>((col + i) * 6 * size), y);
         tft.write(reinterpret_cast<const uint8_t*>(text) + i, j - i);
         _dirty += j - i;
 
@@ -723,6 +736,7 @@ void display::field(int y, uint8_t size, uint16_t color, int slot, const char* t
 
     memcpy(cache, text, len);
     cache[len] = '\0';
+    _cache_color[slot] = color;
 }
 
 void display::row(int idx, uint16_t color, const char* fmt, ...) noexcept
@@ -750,21 +764,78 @@ void display::row(int idx, uint16_t color, const char* fmt, ...) noexcept
     field(content_y + idx * row_h, 1, color, idx + 1, buf);
 }
 
+void display::seg(int y, int& col, uint16_t color, const char* fmt, ...) noexcept
+{
+    char buf[cache_len];
+
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+
+    int slot = _slot++;
+    field(y, 1, color, slot, buf, col);
+    col += static_cast<int>(strlen(buf));
+}
+
+void display::seg_fill(int y, int& col, uint16_t color, const char* fmt, ...) noexcept
+{
+    char buf[cache_len];
+
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+
+    if (n < 0)
+    {
+        n = 0;
+    }
+
+    int avail = cols - col;
+    if (avail < 0)
+    {
+        avail = 0;
+    }
+    if (avail > static_cast<int>(sizeof(buf)) - 1)
+    {
+        avail = static_cast<int>(sizeof(buf)) - 1;
+    }
+
+    // Same reasoning as row()'s padding: this is the last segment on the row, so it
+    // has to erase whatever a longer previous value left behind.
+    for (int i = (n < avail ? n : avail); i < avail; i++)
+    {
+        buf[i] = ' ';
+    }
+    buf[avail] = '\0';
+
+    int slot = _slot++;
+    field(y, 1, color, slot, buf, col);
+    col += avail;
+}
+
 void display::wipe() noexcept
 {
     tft.fillRect(0, content_y - 2, screen_w, screen_h - (content_y - 2), ST77XX_BLACK);
 
     // Blank the caches too, or the next pass compares against text that is no longer
-    // on the screen, decides nothing changed, and leaves the area empty.
+    // on the screen, decides nothing changed, and leaves the area empty. The colour
+    // cache is reset alongside it for the same reason field() checks it at all: a
+    // sentinel colour no real call ever uses forces the first post-wipe draw to be
+    // whole, regardless of what text or hue happened to be cached there before.
     for (int i = 1; i < cache_slots; i++)
     {
         _cache[i][0] = '\x01';
         _cache[i][1] = '\0';
+        _cache_color[i] = ST77XX_BLACK;
     }
 }
 
 void display::refresh() noexcept
 {
+    _slot = slot_dynamic_base;
+
     // Header: the one line that is the same on every page, because it answers the
     // question asked most often -- is the phone actually getting anything.
     //
@@ -772,7 +843,13 @@ void display::refresh() noexcept
     // frame characteristic looks exactly like a working link on the phone, in the
     // advertising name, and in every other counter here, and receives nothing. It is
     // the failure worth spending a colour on.
-    char head[cache_len];
+    //
+    // Drawn as two segments rather than one string: "bluecan" is the wordmark and
+    // stays a fixed navy regardless of state, while the state word after it carries
+    // the status colour. One field() call for the whole line would work too, but only
+    // because field() now forces a whole redraw on any colour change -- see the
+    // comment there. Splitting it keeps the wordmark's slot static across every
+    // repaint, which is one fewer redraw of glass that never changes.
     bool up = RCDEV.connected();
     bool sub = RCDEV.subscribed();
     const char* state = !up ? "adv" : sub ? "SUB" : "BLE";
@@ -783,26 +860,35 @@ void display::refresh() noexcept
     // speaks at connection events. 7.5 ms is as fast as BLE goes; 30 ms is a phone
     // that will not keep up with the bus whatever the firmware does.
     unsigned long tenths = RCDEV.interval() * 125UL / 10UL;
+    char state_buf[cache_len];
     int n;
     if (up && tenths != 0UL)
     {
-        n = snprintf(head, sizeof(head), "bluecan %s %lu.%lums",
+        n = snprintf(state_buf, sizeof(state_buf), " %s %lu.%lums",
                      state, tenths / 10UL, tenths % 10UL);
     }
     else
     {
-        n = snprintf(head, sizeof(head), "bluecan %s", state);
+        n = snprintf(state_buf, sizeof(state_buf), " %s", state);
     }
 
-    // field() draws each character over its own background but does not pad, so a
-    // shorter header would leave the tail of a longer one on the glass.
-    for (; n < head_cols && n < static_cast<int>(sizeof(head)) - 1; n++)
+    if (n < 0)
     {
-        head[n] = ' ';
+        n = 0;
     }
-    head[n] = '\0';
 
-    field(0, 2, state_c, 0, head);
+    // "bluecan" is 7 columns wide at text size 2; the state segment starts right
+    // after it and is padded out to the header's full head_cols width so a shorter
+    // state word cannot leave the tail of a longer one on the glass.
+    constexpr int wordmark_cols = 7;
+    for (; n < head_cols - wordmark_cols && n < static_cast<int>(sizeof(state_buf)) - 1; n++)
+    {
+        state_buf[n] = ' ';
+    }
+    state_buf[n] = '\0';
+
+    field(0, 2, color_blue_dim, _slot++, "bluecan", 0);
+    field(0, 2, state_c, _slot++, state_buf, wordmark_cols);
 
     switch (_page)
     {
@@ -838,8 +924,21 @@ void display::page_bus() noexcept
                          : (status & TWAI_LL_STATUS_ES)            ? ST77XX_YELLOW
                                                                    : ST77XX_GREEN;
 
-    row(0, state_color, "CAN 500k LISTEN-ONLY %s", state);
-    row(1, ST77XX_WHITE, "rx  %9lu %5lu/s", (unsigned long)c.frames, (unsigned long)_rx_rate);
+    // Every row below is a sequence of seg()/seg_fill() calls rather than one row()
+    // call: labels (rx, fwd, flt, ...) are always yellow, values are white unless
+    // they are the one number on the row worth a warning colour, and the last call on
+    // each row is seg_fill() so a value that shrinks cannot leave a longer previous
+    // one's tail on the glass. See the slot_dynamic_base comment in display.hpp for
+    // why none of these calls need an explicit slot number.
+    int col = 0;
+    int y = content_y + 0 * row_h;
+    seg_fill(y, col, state_color, "CAN 500k LISTEN-ONLY %s", state);
+
+    col = 0;
+    y = content_y + 1 * row_h;
+    seg(y, col, ST77XX_YELLOW, "rx");
+    seg_fill(y, col, ST77XX_WHITE, "  %9lu %5lu/s", (unsigned long)c.frames, (unsigned long)_rx_rate);
+
     // What the app asked for, next to what it got. The IDS page says which ids crossed
     // the filter, but not whether the board is filtering at all -- and "the phone never
     // sent its allow-list" and "the phone asked for three ids" look identical from
@@ -858,11 +957,15 @@ void display::page_bus() noexcept
     {
         snprintf(flt_txt, sizeof(flt_txt), "%d%s", flt, flt_over ? "!" : "");
     }
-    row(2, flt_over          ? ST77XX_RED
-         : flt == 0          ? ST77XX_YELLOW
-                             : ST77XX_WHITE,
-        "fwd %9lu %5lu/s flt %s",
-        (unsigned long)c.forwarded, (unsigned long)_fwd_rate, flt_txt);
+    uint16_t flt_color = flt_over ? ST77XX_RED : flt == 0 ? ST77XX_YELLOW : ST77XX_WHITE;
+
+    col = 0;
+    y = content_y + 2 * row_h;
+    seg(y, col, ST77XX_YELLOW, "fwd");
+    seg(y, col, ST77XX_WHITE, " %9lu %5lu/s", (unsigned long)c.forwarded, (unsigned long)_fwd_rate);
+    seg(y, col, ST77XX_YELLOW, " flt");
+    seg_fill(y, col, flt_color, " %s", flt_txt);
+
     // lost is the BLE half of the drop counter two lines down, and it exists for the
     // same reason: BLECharacteristic::notify() returns void and logs a refusal at a
     // level a release build never prints, so a link too slow for the bus would
@@ -872,40 +975,88 @@ void display::page_bus() noexcept
     // second connection doubles the BLE traffic for the same bus while every other
     // counter here keeps looking healthy.
     unsigned long peers = RCDEV.peers();
-    row(3, (ble_lost || peers > 1) ? ST77XX_RED
-         : RCDEV.connected()       ? ST77XX_WHITE
-                                   : ST77XX_YELLOW,
-        "ble %8lu %4lu/s lost %lu p%lu",
-        (unsigned long)RCDEV.frames(), (unsigned long)_ble_rate, ble_lost, peers);
-    row(4, c.queued > (c.capacity / 2) ? ST77XX_YELLOW : ST77XX_WHITE,
-        "queue %4lu peak %4lu/%lu",
-        (unsigned long)c.queued, (unsigned long)c.peak, (unsigned long)c.capacity);
+    // This row stays the wordmark's light blue rather than yellow/white, on request --
+    // it is the BLE identity line, not a generic counter row -- but a real fault
+    // (a dropped notify, or a second subscriber) still overrides it with red, and a
+    // link that is not even connected still shows yellow, same as before the split.
+    bool connected = RCDEV.connected();
+
+    col = 0;
+    y = content_y + 3 * row_h;
+    seg(y, col, ST77XX_CYAN, "ble");
+    seg(y, col, connected ? ST77XX_CYAN : ST77XX_YELLOW,
+        " %8lu %4lu/s", (unsigned long)RCDEV.frames(), (unsigned long)_ble_rate);
+    seg(y, col, ST77XX_CYAN, " lost");
+    seg(y, col, ble_lost ? ST77XX_RED : ST77XX_CYAN, " %lu", ble_lost);
+    seg(y, col, ST77XX_CYAN, " p");
+    seg_fill(y, col, peers > 1 ? ST77XX_RED : ST77XX_CYAN, "%lu", peers);
+
+    col = 0;
+    y = content_y + 4 * row_h;
+    seg(y, col, ST77XX_YELLOW, "queue");
+    seg(y, col, c.queued > (c.capacity / 2) ? ST77XX_YELLOW : ST77XX_WHITE, " %4lu", (unsigned long)c.queued);
+    seg(y, col, ST77XX_YELLOW, " peak");
+    seg_fill(y, col, ST77XX_WHITE, " %4lu/%lu", (unsigned long)c.peak, (unsigned long)c.capacity);
 
     // The line that matters most and is easiest to miss. A dropped frame is silent
     // everywhere else: the bus shows no error, because the loss was ours.
-    row(5, c.dropped ? ST77XX_RED : ST77XX_GREEN,
-        "drop %lu  err %lu", (unsigned long)c.dropped, (unsigned long)c.errors);
+    uint16_t drop_color = c.dropped ? ST77XX_RED : ST77XX_GREEN;
+
+    col = 0;
+    y = content_y + 5 * row_h;
+    seg(y, col, ST77XX_YELLOW, "drop");
+    seg(y, col, drop_color, " %lu", (unsigned long)c.dropped);
+    seg(y, col, ST77XX_YELLOW, "  err");
+    seg_fill(y, col, drop_color, " %lu", (unsigned long)c.errors);
 
     // Frame classes the ISR throws away. A sniffer cannot claim a class is empty by
     // discarding it, so they are counted and shown -- every mapped R9 id is 11-bit,
     // and this is what would say otherwise.
-    row(6, (c.extended || c.remote) ? ST77XX_YELLOW : ST77XX_WHITE,
-        "ext %lu rtr %lu tec %lu rec %lu",
-        (unsigned long)c.extended, (unsigned long)c.remote,
-        (unsigned long)(running ? CANCTLR.tec() : 0U),
-        (unsigned long)(running ? CANCTLR.rec() : 0U));
+    uint16_t anomaly_color = (c.extended || c.remote) ? ST77XX_YELLOW : ST77XX_WHITE;
+
+    col = 0;
+    y = content_y + 6 * row_h;
+    seg(y, col, ST77XX_YELLOW, "ext");
+    seg(y, col, anomaly_color, " %lu", (unsigned long)c.extended);
+    seg(y, col, ST77XX_YELLOW, " rtr");
+    seg(y, col, anomaly_color, " %lu", (unsigned long)c.remote);
+    seg(y, col, ST77XX_YELLOW, " tec");
+    seg(y, col, ST77XX_WHITE, " %lu", (unsigned long)(running ? CANCTLR.tec() : 0U));
+    seg(y, col, ST77XX_YELLOW, " rec");
+    seg_fill(y, col, ST77XX_WHITE, " %lu", (unsigned long)(running ? CANCTLR.rec() : 0U));
 
     UBaseType_t stack = _handle ? uxTaskGetStackHighWaterMark(_handle) : 0;
-    row(7, ST77XX_WHITE, "heap %luk min %luk stk %lu",
-        (unsigned long)(ESP.getFreeHeap() / 1024), (unsigned long)(_min_heap / 1024),
-        (unsigned long)stack);
+
+    col = 0;
+    y = content_y + 7 * row_h;
+    seg(y, col, ST77XX_YELLOW, "heap");
+    seg(y, col, ST77XX_WHITE, " %luk", (unsigned long)(ESP.getFreeHeap() / 1024));
+    seg(y, col, ST77XX_YELLOW, " min");
+    seg(y, col, ST77XX_WHITE, " %luk", (unsigned long)(_min_heap / 1024));
+    seg(y, col, ST77XX_YELLOW, " stk");
+    seg_fill(y, col, ST77XX_WHITE, " %lu", (unsigned long)stack);
 
     // What a repaint costs, on the glass it costs it on. A full repaint of this panel
     // is ~198 ms and a change-detected one ~160 us; if max ever climbs back towards
-    // the former, the change detection has stopped working.
-    row(8, ST77XX_WHITE, "draw %luus max %luus up %lus",
-        (unsigned long)_draw_us_shown, (unsigned long)_draw_us_max,
-        (unsigned long)(millis() / 1000));
+    // the former, the change detection has stopped working. Shown in milliseconds --
+    // microsecond precision is noise nobody standing over the board can read -- and
+    // uptime as hhh:mm:ss rather than a raw second count that stops being legible
+    // within the first ride.
+    unsigned long draw_shown_ds = (unsigned long)_draw_us_shown / 100UL;
+    unsigned long draw_max_ds = (unsigned long)_draw_us_max / 100UL;
+    unsigned long up_s = millis() / 1000UL;
+    unsigned long up_h = up_s / 3600UL;
+    unsigned long up_m = (up_s % 3600UL) / 60UL;
+    unsigned long up_sec = up_s % 60UL;
+
+    col = 0;
+    y = content_y + 8 * row_h;
+    seg(y, col, ST77XX_YELLOW, "draw");
+    seg(y, col, ST77XX_WHITE, " %lu.%lums", draw_shown_ds / 10UL, draw_shown_ds % 10UL);
+    seg(y, col, ST77XX_YELLOW, " max");
+    seg(y, col, ST77XX_WHITE, " %lu.%lums", draw_max_ds / 10UL, draw_max_ds % 10UL);
+    seg(y, col, ST77XX_YELLOW, " up");
+    seg_fill(y, col, ST77XX_WHITE, " %03lu:%02lu:%02lu", up_h, up_m, up_sec);
 }
 
 void display::page_ids() noexcept
@@ -1022,6 +1173,8 @@ display::display() noexcept
     , _rate_ms(0U)
     , _stats_timer{}
     , _cache{}
+    , _cache_color{}
+    , _slot(0)
 {
 }
 
@@ -1039,8 +1192,10 @@ void display::update_status_led() noexcept {}
 #if defined(DEBUG)
 void display::report_status_led() noexcept {}
 #endif
-void display::field(int, uint8_t, uint16_t, int, const char*) noexcept {}
+void display::field(int, uint8_t, uint16_t, int, const char*, int) noexcept {}
 void display::row(int, uint16_t, const char*, ...) noexcept {}
+void display::seg(int, int&, uint16_t, const char*, ...) noexcept {}
+void display::seg_fill(int, int&, uint16_t, const char*, ...) noexcept {}
 void display::wipe() noexcept {}
 void display::page_bus() noexcept {}
 void display::page_ids() noexcept {}
