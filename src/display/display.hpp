@@ -108,6 +108,15 @@ private:
     void poll_buttons() noexcept;
     void sample_rates() noexcept;
 
+    /**
+     * Drive the status pixel from the counters this task already reads.
+     *
+     * Runs every pass of the loop, not every repaint: the light is an animation and
+     * the panel is not, and it must keep working in the light position where the
+     * panel does not repaint at all. Costs a comparison unless the colour changed.
+     */
+    void update_status_led() noexcept;
+
     /// draw one line, but only if its text differs from what is already on the glass
     void field(int y, uint8_t size, uint16_t color, int slot, const char* text) noexcept;
     /// format one content row, space-padded to the full width so the previous line
@@ -129,6 +138,17 @@ private:
         page_ids_id = 1,
         page_last_id = 2,
         page_count = 3,
+    };
+
+    /// what D0 cycles through. The middle position is the riding one: the backlight
+    /// and the repaint are the two expensive things on this board and the status
+    /// light is the one worth keeping, at ~30 us an update.
+    enum light : uint8_t
+    {
+        light_both = 0,
+        light_pixel = 1,
+        light_dark = 2,
+        light_count = 3,
     };
 
     /// arbitration ids tracked by the census. The R1-family bus carries ~16
@@ -165,8 +185,20 @@ private:
     // --- display task only
     TaskHandle_t _handle;
     uint8_t _page;
-    bool _lit;
+    uint8_t _light;
     bool _hold;
+    /// the fault overlay, once armed. Latching, because dropped and lost are
+    /// cumulative counters and the moment one of them moves is the moment nobody is
+    /// looking. Only a reboot clears it; the BUS page says which one it was.
+    bool _fault;
+    /// millis() of the last non-zero forwarded-frame rate. What separates a slow
+    /// link from a stopped one, which no other indicator on this board can do.
+    uint32_t _flow_ms;
+    /// RCDEV.lost() as of the last sample. The fault latch wants the growth, not the
+    /// total: a test connection asks for every id and is not rate-limited, so
+    /// refusals during one are the documented behaviour rather than a fault, and the
+    /// count they leave behind must not arm the light for the session after it.
+    uint32_t _lost_prev;
     uint32_t _draw_us;
     uint32_t _draw_us_max;
     /// _draw_us as of the last one-second sample. What the panel shows has to change

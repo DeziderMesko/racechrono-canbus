@@ -23,6 +23,7 @@
 
 #include "../canbus/controller.hpp"
 #include "../canbus/decoder.hpp"
+#include "../led/led.hpp"
 #include "../logging/logging.hpp"
 #include "../racechrono/device.hpp"
 
@@ -88,6 +89,61 @@ const char* bus_state(uint32_t status)
     return "RUN";
 }
 
+#if defined(CONFIG_STATUS_LED)
+
+/// how long the forwarded rate must read zero before the light calls it stopped
+/// rather than slow. Two seconds is four samples of a rate that updates once a
+/// second, and forty times the gap between frames at the ~20 msg/s per id a
+/// recording session actually produces.
+constexpr uint32_t flow_dead_ms = 2000;
+/// the flatline pulse: one dim blip this often, so a stopped link still looks alive
+/// enough to be worth reading rather than dead enough to be mistaken for off
+constexpr uint32_t flatline_ms = 2000;
+/// how long a blip, a flatline pulse or a fault flash lasts
+constexpr uint32_t flash_ms = 60;
+/// what a blip falls back to between flashes. Not zero: the hue is the state, and
+/// dropping it entirely would make a slow link indistinguishable from a dark board.
+constexpr uint8_t blip_floor = 64;
+/// the fault overlay's period
+constexpr uint32_t fault_ms = 1000;
+
+/// 0-255 triangle over one period. A triangle rather than a sine because it costs
+/// two branches and a multiply, and at this brightness the difference is invisible.
+uint8_t breathe(uint32_t now, uint32_t period_ms) noexcept
+{
+    const uint32_t phase = now % period_ms;
+    const uint32_t half = period_ms / 2U;
+    const uint32_t up = phase < half ? phase : period_ms - phase;
+    return static_cast<uint8_t>((up * 255U) / half);
+}
+
+/// square wave, on for the first half of the period
+__always_inline uint8_t blink(uint32_t now, uint32_t period_ms) noexcept
+{
+    return (now % period_ms) < (period_ms / 2U) ? 255U : 0U;
+}
+
+/// a short flash on a dim floor, at the rate frames are actually being forwarded.
+/// Clamped at both ends: below 1 Hz it would be indistinguishable from the flatline
+/// it exists to contrast with, and above 5 Hz from a solid colour.
+__always_inline uint8_t blip(uint32_t now, uint32_t rate) noexcept
+{
+    uint32_t hz = rate / 8U;
+    if (hz < 1U) { hz = 1U; }
+    if (hz > 5U) { hz = 5U; }
+
+    const uint32_t period = 1000U / hz;
+    return (now % period) < flash_ms ? 255U : blip_floor;
+}
+
+/// scale one component of a full-scale colour by a 0-255 pattern level
+__always_inline uint8_t level(uint8_t component, uint8_t lvl) noexcept
+{
+    return static_cast<uint8_t>((static_cast<uint32_t>(component) * lvl) / 255U);
+}
+
+#endif // CONFIG_STATUS_LED
+
 } // namespace
 
 namespace ui
@@ -110,8 +166,11 @@ display::display() noexcept
     , _ring_pos(0U)
     , _handle(nullptr)
     , _page(page_bus_id)
-    , _lit(true)
+    , _light(light_both)
     , _hold(false)
+    , _fault(false)
+    , _flow_ms(0U)
+    , _lost_prev(0U)
     , _draw_us(0U)
     , _draw_us_max(0U)
     , _draw_us_shown(0U)
@@ -223,6 +282,13 @@ void display::run() noexcept
     tft.fillScreen(ST77XX_BLACK);
     wipe();
 
+#if defined(CONFIG_STATUS_LED)
+    // Here rather than lazily on the first update: this is the call that allocates
+    // the RMT channel behind the pixel, and start-up is where an allocation belongs
+    // on a board whose free heap is a measurement.
+    LED.status_begin();
+#endif
+
     _rate_ms = millis();
 
     uint32_t last_paint = 0;
@@ -241,9 +307,14 @@ void display::run() noexcept
             sample_rates();
         }
 
+        // Every pass, and before the repaint: the light is the instrument that still
+        // works in the two positions where the panel does not, and 25 ms is the
+        // animation's frame time.
+        update_status_led();
+
         uint32_t interval = _page == page_bus_id ? refresh_bus_ms : refresh_slow_ms;
 
-        if (_lit && !_hold && (now - last_paint) >= interval)
+        if (_light == light_both && !_hold && (now - last_paint) >= interval)
         {
             last_paint = now;
             uint32_t t0 = micros();
@@ -273,8 +344,12 @@ void display::stats() noexcept
                              : _page == page_last_id ? "LAST"
                                                      : "BUS";
 
-            infoln("      Display page: %s%s%s", name,
-                   _lit ? "" : " (dark)", _hold ? " (held)" : "");
+            const char* lightness = _light == light_both ? ""
+                                  : _light == light_pixel ? " (panel off)"
+                                                          : " (dark)";
+
+            infoln("      Display page: %s%s%s", name, lightness,
+                   _hold ? " (held)" : "");
             infoln("      Display draw: %lu us, worst %lu us, %lu chars",
                    (unsigned long)_draw_us, (unsigned long)_draw_us_max,
                    (unsigned long)_dirty);
@@ -300,11 +375,13 @@ void display::poll_buttons() noexcept
 
     if (light && !p_light)
     {
-        // Backlight off also stops the repaint, which makes this the cheapest
-        // experiment on the board: everything else keeps running, so any difference
-        // in the frame counters afterwards is the display's cost and nothing else.
-        _lit = !_lit;
-        digitalWrite(TFT_BACKLITE, _lit ? HIGH : LOW);
+        // Three positions: panel and pixel, pixel alone, dark. Backlight off also
+        // stops the repaint, which makes the middle position the cheapest experiment
+        // on the board -- everything else keeps running, and the pixel costs ~30 us
+        // an update, so any difference in the frame counters afterwards is the
+        // panel's cost and nothing else. The third is for riding at night.
+        _light = (_light + 1U) % light_count;
+        digitalWrite(TFT_BACKLITE, _light == light_both ? HIGH : LOW);
     }
 
     if (next && !p_next)
@@ -366,6 +443,132 @@ void display::sample_rates() noexcept
     {
         _min_heap = heap;
     }
+
+#if defined(CONFIG_STATUS_LED)
+    // The status light's two pieces of state are sampled here, at 1 Hz, rather than
+    // on the light's own 25 ms tick. The fault latches, so a second's delay in
+    // noticing costs nothing, and this keeps the tick off RCDEV.peers() -- the one
+    // term in it that reaches into the NimBLE server rather than reading an atomic.
+    const uint32_t lost = RCDEV.lost();
+
+    // A dropped frame, an allow-list too small for what the app asked for and a
+    // second subscriber are faults whenever they happen: the first is always ours,
+    // the second silently loses a channel the rider defined, the third doubles the
+    // radio's work for the same bus.
+    if (!_fault
+        && (c.dropped != 0U || CANDEC.filter_overflow() != 0U || RCDEV.peers() > 1U))
+    {
+        _fault = true;
+    }
+
+    // A refusal is only a fault while the allow-list is in force. An allow-all --
+    // what RaceChrono sends while channels are being configured -- has no per-id slot
+    // to rate-limit against, so it offers the whole bus to a radio measured at about
+    // 590 msg/s and refusals are the expected result. Measured on the bench the day
+    // this landed: a test connection at ~919 msg/s left 15001 behind. Latching on the
+    // total would light the fault for every session after that one, so this latches
+    // on growth, and only once the filter is active.
+    if (!_fault && CANDEC.filter_size() >= 0 && lost > _lost_prev)
+    {
+        _fault = true;
+    }
+
+    _lost_prev = lost;
+
+    if (_fwd_rate != 0U)
+    {
+        _flow_ms = now;
+    }
+#endif
+}
+
+void display::update_status_led() noexcept
+{
+#if defined(CONFIG_STATUS_LED)
+    if (_light == light_dark)
+    {
+        LED.status_end();
+        return;
+    }
+
+    const uint32_t now = millis();
+    const bool running = CANCTLR.running();
+    const uint32_t status = running ? CANCTLR.status() : 0U;
+
+    // One LED, so precedence is strict. Hue says where the chain is, motion says
+    // frames are moving, and every term below is a counter the BUS page already
+    // reads -- nothing is measured for the light's sake.
+    //
+    // What is deliberately absent is vehicle data. This firmware forwards raw frames
+    // and never decodes a signal, which is why an unfinished canbus-mapping.md never
+    // blocks it; a shift light would need a confirmed mapping, a decoder here and a
+    // scale to trust, which is the sniffer role that was settled the other way.
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+    uint8_t lvl;
+
+    if (!running)
+    {
+        // The controller is not up. In practice this is the second and a half
+        // between the display task starting and setup() reaching CANCTLR.start(),
+        // because a failure there restarts the board -- so read it as booting.
+        r = 255; g = 255; b = 255;
+        lvl = breathe(now, 2000U);
+    }
+    else if (status & TWAI_LL_STATUS_BS)
+    {
+        // Bus-off. Nearly unreachable in listen-only, where this node never
+        // transmits and its error counters are frozen, and kept for the day that
+        // assumption is wrong: two comparisons is a fair price.
+        r = 255; g = 0; b = 0;
+        lvl = 255;
+    }
+    else if (status & TWAI_LL_STATUS_ES)
+    {
+        r = 255; g = 140; b = 0;
+        lvl = blink(now, 1000U);
+    }
+    else if (!RCDEV.subscribed())
+    {
+        // Nobody is taking frames -- either nothing is connected, or something is
+        // connected and has not subscribed. One colour for both: they differ in what
+        // the rider would do about it not at all, and the header on the BUS page
+        // separates them for anyone standing over the board.
+        r = 0; g = 0; b = 255;
+        lvl = breathe(now, 2000U);
+    }
+    else
+    {
+        // Yellow while RaceChrono is configuring channels and asking for every id,
+        // green once it is recording and asking for the handful it has channels for.
+        // The difference matters: an allow-all is not rate-limited, so it is also the
+        // one state in which this link is expected to refuse frames.
+        const bool unfiltered = CANDEC.filter_size() < 0;
+
+        r = unfiltered ? 255 : 0;
+        g = 255;
+        b = 0;
+
+        // Slow and stopped are the two states no other indicator on this board can
+        // tell apart, and a diagnostic connector that fell off is the second one.
+        lvl = (now - _flow_ms) >= flow_dead_ms
+            ? ((now % flatline_ms) < flash_ms ? blip_floor : 0U)
+            : blip(now, _fwd_rate);
+    }
+
+    // The fault is an overlay, not a rung. Made a rung it would replace the hue and
+    // hide whether frames were still flowing at the moment that is most worth
+    // knowing; flashed over it, "recording, and something was lost" is one glance
+    // from "recording".
+    if (_fault && (now % fault_ms) < flash_ms)
+    {
+        r = 255; g = 0; b = 0;
+        lvl = 255;
+    }
+
+    LED.status(level(r, lvl), level(g, lvl), level(b, lvl));
+#endif
 }
 
 void display::field(int y, uint8_t size, uint16_t color, int slot, const char* text) noexcept
@@ -693,8 +896,11 @@ display::display() noexcept
     , _ring_pos(0U)
     , _handle(nullptr)
     , _page(page_bus_id)
-    , _lit(false)
+    , _light(light_dark)
     , _hold(false)
+    , _fault(false)
+    , _flow_ms(0U)
+    , _lost_prev(0U)
     , _draw_us(0U)
     , _draw_us_max(0U)
     , _draw_us_shown(0U)
@@ -722,6 +928,7 @@ void display::run() noexcept {}
 void display::refresh() noexcept {}
 void display::poll_buttons() noexcept {}
 void display::sample_rates() noexcept {}
+void display::update_status_led() noexcept {}
 void display::field(int, uint8_t, uint16_t, int, const char*) noexcept {}
 void display::row(int, uint16_t, const char*, ...) noexcept {}
 void display::wipe() noexcept {}

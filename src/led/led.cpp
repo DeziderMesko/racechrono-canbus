@@ -52,6 +52,10 @@ led::led() noexcept
         .duty           = 0, // Set duty to 0%
         .hpoint         = 0
     }
+#if defined(CONFIG_STATUS_LED)
+    , _status_last(0xFFFFFFFFU)
+    , _status_powered(false)
+#endif
 {
     ledc_timer_config(&_timer_config);
     ledc_channel_config(&_channel_config);
@@ -68,5 +72,78 @@ void led::builtin_on() noexcept
     ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 8191 /* 13-bit max */);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
 }
+
+#if defined(CONFIG_STATUS_LED)
+
+namespace
+{
+
+/// scale a full-scale component down to the level the pixel is actually driven at.
+/// Rounding up from any non-zero input on purpose: a colour asked for dimly and
+/// delivered as black is a state the rider cannot see.
+__always_inline uint8_t dim(uint8_t v) noexcept
+{
+    uint32_t scaled = (static_cast<uint32_t>(v) * CONFIG_STATUS_LED_LEVEL) / 255U;
+    return static_cast<uint8_t>((scaled == 0U && v != 0U) ? 1U : scaled);
+}
+
+} // namespace
+
+void led::status_begin() noexcept
+{
+    pinMode(NEOPIXEL_POWER, OUTPUT);
+    digitalWrite(NEOPIXEL_POWER, NEOPIXEL_POWER_ON);
+    _status_powered = true;
+
+    // Unconditional: this is the write that allocates the RMT channel, and the
+    // de-duplication below would skip it if the cached colour happened to match.
+    _status_last = 0U;
+    rgbLedWrite(PIN_NEOPIXEL, 0, 0, 0);
+}
+
+void led::status(uint8_t r, uint8_t g, uint8_t b) noexcept
+{
+    const uint8_t dr = dim(r);
+    const uint8_t dg = dim(g);
+    const uint8_t db = dim(b);
+
+    const uint32_t packed = (static_cast<uint32_t>(dr) << 16)
+                          | (static_cast<uint32_t>(dg) << 8)
+                          | static_cast<uint32_t>(db);
+
+    if (!_status_powered)
+    {
+        digitalWrite(NEOPIXEL_POWER, NEOPIXEL_POWER_ON);
+        _status_powered = true;
+        // The pixel's own latch does not survive its power rail, so whatever was
+        // cached describes a chip that has since forgotten it.
+        _status_last = 0xFFFFFFFFU;
+    }
+
+    if (packed == _status_last)
+    {
+        return;
+    }
+
+    _status_last = packed;
+    rgbLedWrite(PIN_NEOPIXEL, dr, dg, db);
+}
+
+void led::status_end() noexcept
+{
+    if (!_status_powered)
+    {
+        return;
+    }
+
+    // Dark first, then the rail: cutting power to a lit pixel leaves it lit for as
+    // long as its capacitor holds, which looks like a fault rather than an off.
+    rgbLedWrite(PIN_NEOPIXEL, 0, 0, 0);
+    digitalWrite(NEOPIXEL_POWER, LOW);
+    _status_powered = false;
+    _status_last = 0xFFFFFFFFU;
+}
+
+#endif // CONFIG_STATUS_LED
 
 } // namespace led

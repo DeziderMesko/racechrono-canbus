@@ -103,6 +103,11 @@
 #define BLE_PWR_LVL ESP_PWR_LVL_P12
 /// this board has the 240x135 ST7789 and the three buttons; src/display drives them
 #define CONFIG_DISPLAY_TFT 1
+/// ...and one WS2812 on PIN_NEOPIXEL, gated by NEOPIXEL_POWER. It is the only
+/// instrument on this board readable from a moving bike, so src/display drives it as
+/// a status light for the chain -- bus, queue, radio, phone. See
+/// motocan/bluecan/firmware.md, patch 16.
+#define CONFIG_STATUS_LED 1
 #endif
 
 // ESP32 Dev Module
