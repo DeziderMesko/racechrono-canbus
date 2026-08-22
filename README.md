@@ -109,12 +109,21 @@ queue slot or an mbuf.
 
 Three pages on the TFT, on their own task on core 0 — bus health, the ID census, the last
 raw frames — repainting a character cell at a time through a change-detection cache.
-Buttons: **D0** kills the backlight, **D1** cycles pages, **D2** freezes the glass without
-pausing the counting.
+Buttons: **D0** cycles panel + pixel, pixel alone, dark; **D1** cycles pages; **D2**
+freezes the glass without pausing the counting.
 
 This puts dropped frames, queue peak, refusals and the discarded 29-bit/RTR classes in
 front of the rider **in a release build**, where they previously existed only in a `DEBUG`
-serial log.
+serial log. The BUS page's top row also carries the supply voltage, read off the board's
+MAX17048 fuel gauge — note that it is the BAT rail, not the 5 V coming in over USB, which
+nothing on this board can see. State of charge and a charge/discharge marker are behind
+`CONFIG_CELL_FITTED`, because the gauge cannot tell whether a cell is in the jack and
+models the charger's rail as one when it is not.
+
+**The on-board NeoPixel is driven as a status light**, on the same task: hue for where the
+chain is (booting / advertising / configuring / recording), blips at a rate that follows
+the forwarded frames, a double flash when they stop, and a latching red flash over the top
+when something is lost. It never shows vehicle data — this firmware decodes nothing.
 
 ### Logging
 
@@ -201,7 +210,7 @@ the same load with a console attached killed the board at 2.08 s and 4.58 s over
 **First phone session**, before any of the throughput work: 8018 frames, 0 lost, 0 errors,
 one subscribed peer, a channel on the phone tracking a synthetic sweep.
 
-**The display costs nothing measurable.** An idle pass is ~280 µs and a busy one 2–6 ms,
+**The display costs nothing measurable.** An idle pass is ~420 µs and a busy one 2–6 ms,
 against ~250 ms for a full repaint — which happens once, at boot, into an empty cache. The
 frame counters do not move when it runs.
 
@@ -235,8 +244,11 @@ list is an easy mistake to make — it was made here first.
   outright unless min ≥ 15 ms, max ≥ min + 15 ms, and a rejected request leaves whatever
   the phone picked on its own — worse than asking for less. The iOS-safe pair is 12/24
   (15–30 ms), legal on both platforms, and is noted in the header.
-- Upstream's open items: histograms in `candump-parse`, BLE 4.0 vs 5.0 comparison,
-  NeoPixel support on the S3 boards.
+- **Nothing with a cell in the JST jack has been tested**: the fuel gauge's state of
+  charge and its charge/discharge marker are written but sit behind `CONFIG_CELL_FITTED`,
+  and only the voltage half has been read on a board.
+- Upstream's open items: histograms in `candump-parse`, BLE 4.0 vs 5.0 comparison.
+  (NeoPixel support on the S3 boards was one of them and is done here.)
 
 ## Debugging
 
