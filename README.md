@@ -197,9 +197,9 @@ the table, nowhere near the whole of it.
 Going direct to the host instead of through `BLECharacteristic::notify()` halves the
 refusals mid-ramp and thirds them at the end (0.35% vs 0.8% at ~590 msg/s, 12% vs 35% at
 ~846) — that pair *was* taken at a single negotiated interval, 15.00 ms, which is what
-makes it an A/B at all — but it does not move the wall. Every refusal is still the host running out of
-mbufs because the radio cannot drain them at the interval the phone chose. Cheaper work
-upstream of a full queue only delays filling it.
+makes it an A/B at all — but it does not move the wall. Every refusal is still the host
+running out of mbufs because the radio cannot drain them at the interval the phone chose.
+Cheaper work upstream of a full queue only delays filling it.
 
 **The filter is what makes the ceiling stop mattering.** Against a *recording* RaceChrono
 at a 15.00 ms interval, with three allowed IDs at the 50 ms the app asked for, plus an
