@@ -707,7 +707,7 @@ void display::field(int y, uint8_t size, uint16_t color, int slot, const char* t
     // behind) cannot be diffed character-by-character. Colour, because two draws can
     // share every character at some position while wanting a different hue there --
     // e.g. the header's "bluecan " prefix is identical whether the state word after it
-    // is "SUB" or "BLE" -- and a plain character diff would then skip repainting
+    // is "SUB" or "connected" -- and a plain character diff would then skip repainting
     // characters that are still showing the previous call's colour, leaving the line
     // part one hue and part the other. Column, because seg()/seg_fill() chain several
     // slots left to right on one row: if an earlier slot's text changes width (the
@@ -861,7 +861,7 @@ void display::refresh() noexcept
     // repaint, which is one fewer redraw of glass that never changes.
     bool up = RCDEV.connected();
     bool sub = RCDEV.subscribed();
-    const char* state = !up ? "adv" : sub ? "SUB" : "BLE";
+    const char* state = !up ? "advertising" : sub ? "SUB" : "connected";
     uint16_t state_c = !up ? ST77XX_YELLOW : sub ? ST77XX_GREEN : ST77XX_RED;
 
     // Connection interval, in tenths of a millisecond: the link reports it in 1.25 ms
@@ -871,7 +871,10 @@ void display::refresh() noexcept
     unsigned long tenths = RCDEV.interval() * 125UL / 10UL;
     char state_buf[cache_len];
     int n;
-    if (up && tenths != 0UL)
+    // Only once subscribed: "connected 7.5ms" plus "bluecan " no longer fits the
+    // header's 13-column budget for the state word, and SUB is the state this number
+    // actually matters for -- it is the ceiling on the data RaceChrono is now getting.
+    if (sub && tenths != 0UL)
     {
         n = snprintf(state_buf, sizeof(state_buf), " %s %lu.%lums",
                      state, tenths / 10UL, tenths % 10UL);
