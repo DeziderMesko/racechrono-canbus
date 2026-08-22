@@ -348,6 +348,17 @@ void controller::isr() noexcept
                 continue;
             }
 
+            // The DLC field is four bits, so the wire can say 9-15. CAN 2.0 requires a
+            // receiver to accept that and treat the payload as eight bytes, and a bit
+            // error in the nibble on a vehicle harness produces the same thing. Clamp
+            // once, here: it sizes both the copy below and the length the drain task
+            // hands to RCDEV.send(), neither of which has more than eight bytes to work
+            // with. ESP-IDF's own twai_ll_parse_frame() clamps for the same reason.
+            if (RCUNLIKELY(f.info.dlc > 8))
+            {
+                f.info.dlc = 8;
+            }
+
             // copy data bytes
             for (uint8_t i = 0; i < f.info.dlc; i++)
             {

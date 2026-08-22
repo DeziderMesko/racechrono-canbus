@@ -157,7 +157,8 @@ bool display::start() noexcept
 void display::note(canbus::frame const& f) noexcept
 {
     uint32_t id = f.id;
-    int used = _id_used;
+    // Relaxed: this task is the only writer of either index.
+    int used = _id_used.load(std::memory_order_relaxed);
     bool known = false;
 
     for (int i = 0; i < used; i++)
@@ -175,12 +176,13 @@ void display::note(canbus::frame const& f) noexcept
         if (used < id_slots)
         {
             // fill the slot before publishing it, so the display task cannot read a
-            // half-written entry: _id_used is what makes the slot visible
+            // half-written entry: _id_used is what makes the slot visible, and the
+            // release is what stops the four stores above being sunk past it
             _ids[used] = id;
             _hits[used] = 1;
             _hits_prev[used] = 0;
             _rates[used] = 0;
-            _id_used = used + 1;
+            _id_used.store(used + 1, std::memory_order_release);
         }
         else
         {
@@ -188,9 +190,9 @@ void display::note(canbus::frame const& f) noexcept
         }
     }
 
-    uint32_t pos = _ring_pos;
+    uint32_t pos = _ring_pos.load(std::memory_order_relaxed);
     _ring[pos % ring_slots] = f;
-    _ring_pos = pos + 1;
+    _ring_pos.store(pos + 1, std::memory_order_release);
 }
 
 void display::task(void* arg)
@@ -278,7 +280,8 @@ void display::stats() noexcept
             infoln("     Display stack: %lu bytes free",
                    (unsigned long)(_handle ? uxTaskGetStackHighWaterMark(_handle) : 0));
             infoln("        Census ids: %d, %lu over",
-                   _id_used, (unsigned long)_id_overflow);
+                   _id_used.load(std::memory_order_acquire),
+                   (unsigned long)_id_overflow);
         }
     }
 }
@@ -347,7 +350,7 @@ void display::sample_rates() noexcept
     _fwd_prev = c.forwarded;
     _ble_prev = ble;
 
-    int used = _id_used;
+    int used = _id_used.load(std::memory_order_acquire);
     for (int i = 0; i < used; i++)
     {
         uint32_t hits = _hits[i];
@@ -514,8 +517,12 @@ void display::refresh() noexcept
 void display::page_bus() noexcept
 {
     canbus::controller::counters_t c = CANCTLR.counters();
-    uint32_t status = CANCTLR.status();
+    // Nothing is read off the peripheral until install() has ungated its clock: this
+    // task starts several seconds before that and would otherwise be sampling a
+    // controller still held in reset. Zero is the honest reading meanwhile -- both
+    // error counters are frozen there in listen-only mode anyway.
     bool running = CANCTLR.running();
+    uint32_t status = running ? CANCTLR.status() : 0U;
     const char* state = running ? bus_state(status) : "DOWN";
     uint16_t state_color = !running || (status & TWAI_LL_STATUS_BS) ? ST77XX_RED
                          : (status & TWAI_LL_STATUS_ES)            ? ST77XX_YELLOW
@@ -553,7 +560,8 @@ void display::page_bus() noexcept
     row(6, (c.extended || c.remote) ? ST77XX_YELLOW : ST77XX_WHITE,
         "ext %lu rtr %lu tec %lu rec %lu",
         (unsigned long)c.extended, (unsigned long)c.remote,
-        (unsigned long)CANCTLR.tec(), (unsigned long)CANCTLR.rec());
+        (unsigned long)(running ? CANCTLR.tec() : 0U),
+        (unsigned long)(running ? CANCTLR.rec() : 0U));
 
     UBaseType_t stack = _handle ? uxTaskGetStackHighWaterMark(_handle) : 0;
     row(7, ST77XX_WHITE, "heap %luk min %luk stk %lu",
@@ -570,9 +578,15 @@ void display::page_bus() noexcept
 
 void display::page_ids() noexcept
 {
-    int used = _id_used;
+    int used = _id_used.load(std::memory_order_acquire);
 
-    row(0, ST77XX_CYAN, "ids seen %d%s", used, _id_overflow ? " (+more)" : "");
+    // The census holds id_slots entries and this page has room for fewer, so there are
+    // two ways to be hiding an id. Both have to raise the marker, or a truncated list
+    // reads as the whole bus -- which is the one question this page exists to answer.
+    static constexpr int id_cells = (rows - 1) * 2;
+
+    row(0, ST77XX_CYAN, "ids seen %d%s", used,
+        (_id_overflow || used > id_cells) ? " (+more)" : "");
 
     // Two columns of ids, newest-discovered last. This is the first question the
     // device exists to answer: which CAN family the R9 belongs to is read off the id
@@ -603,7 +617,7 @@ void display::page_ids() noexcept
 
 void display::page_last() noexcept
 {
-    uint32_t pos = _ring_pos;
+    uint32_t pos = _ring_pos.load(std::memory_order_acquire);
 
     row(0, ST77XX_CYAN, "last frames  (newest first)");
 

@@ -25,6 +25,8 @@
 #include "../canbus/frame.hpp"
 #include "../utils/timer.hpp"
 
+#include <atomic>
+
 #include <freertos/task.h>
 
 namespace ui
@@ -130,7 +132,8 @@ private:
     };
 
     /// arbitration ids tracked by the census. The R1-family bus carries ~16
-    /// (motocan/canbus-mapping.md), and 20 rows is what the panel can show.
+    /// (motocan/canbus-mapping.md). The IDS page shows fewer than this -- see
+    /// id_cells in page_ids() -- and says so when it is hiding any.
     static constexpr int id_slots = 20;
     /// recent frames kept for the LAST page
     static constexpr int ring_slots = 6;
@@ -143,15 +146,21 @@ private:
     // torn read costs one stale line for 200 ms and nothing else. A mutex here would
     // put the CAN drain behind the panel, which is the one thing this module exists
     // to avoid.
+    //
+    // The two indices are the exception, and they are atomic rather than volatile:
+    // each one publishes the slot written just before it, and volatile orders nothing
+    // against a plain store, so the compiler is free to sink the slot's contents past
+    // it. Released here, acquired by every reader, which is the whole synchronisation
+    // in this module.
     uint32_t _ids[id_slots];
     uint32_t _hits[id_slots];
     uint32_t _hits_prev[id_slots];
     uint16_t _rates[id_slots];
-    volatile int _id_used;
+    std::atomic<int> _id_used;
     uint32_t _id_overflow;
 
     canbus::frame _ring[ring_slots];
-    volatile uint32_t _ring_pos;
+    std::atomic<uint32_t> _ring_pos;
 
     // --- display task only
     TaskHandle_t _handle;

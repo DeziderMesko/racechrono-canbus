@@ -79,17 +79,18 @@ public:
     }
 
     /**
-     * @return notification outcomes reported since boot, which is **not** the same as
-     * frames(). NimBLE raises onStatus() twice for every notification, from two places
-     * that mean different things: synchronously at the end of notify(), meaning the
-     * host accepted it into its queue, and again from the BLE_GAP_EVENT_NOTIFY_TX GAP
-     * event, meaning the controller actually put it on the air.
+     * @return notifications the controller actually put on the air, cumulative,
+     * counted from the BLE_GAP_EVENT_NOTIFY_TX dispatch into onStatus().
      *
-     * So the healthy reading is **twice frames()**, and the ratio is the diagnostic:
-     * 2:1 is a link that queues and transmits, 1:1 a link that queues and then does
-     * not. The two paths are indistinguishable from inside onStatus() -- both report
-     * SUCCESS_NOTIFY with code 0 -- which is why frames() is counted where the frame
-     * is offered instead.
+     * So the healthy reading is **equal to frames()**, and the shortfall between the
+     * two is the diagnostic: frames offered to the host that never reached the air.
+     *
+     * It read twice frames() while the frame path still went through
+     * BLECharacteristic::notify(), which reports a second success synchronously at the
+     * end of the call to mean the host accepted the frame into its queue. The two are
+     * indistinguishable from inside onStatus() -- both report SUCCESS_NOTIFY with code
+     * 0 -- so going straight at the host left only the event that means something. A
+     * build with RC_WRAPPER_NOTIFY defined reads 2:1 again.
      */
     __always_inline uint32_t notifies() const noexcept
     {
