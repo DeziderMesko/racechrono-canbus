@@ -203,7 +203,7 @@ public:
      */
     __always_inline void send(uint8_t* data, size_t len) noexcept
     {
-        if (!_client_connected)
+        if (!_client_connected.load(std::memory_order_relaxed))
         {
             return;
         }
@@ -211,7 +211,9 @@ public:
         _ble_offered.fetch_add(1, std::memory_order_relaxed);
 
 #if defined(CONFIG_NIMBLE_ENABLED) && !defined(RC_WRAPPER_NOTIFY)
-        if (RCLIKELY(_frames_handle != null_handle))
+        const uint16_t handle = _frames_handle.load(std::memory_order_relaxed);
+
+        if (RCLIKELY(handle != null_handle))
         {
             uint16_t conn = _conn_handle.load(std::memory_order_relaxed);
 
@@ -235,7 +237,7 @@ public:
             }
 
             // Consumes the mbuf whatever the outcome, so there is nothing to free here.
-            int rc = ble_gatts_notify_custom(conn, _frames_handle, om);
+            int rc = ble_gatts_notify_custom(conn, handle, om);
 
             if (RCUNLIKELY(rc != 0))
             {
@@ -366,11 +368,18 @@ private:
     /// Resolved in onSubscribe() rather than at creation: NimBLE fills the wrapper's
     /// copy in while it registers the GATT table, so reading it any earlier returns
     /// null_handle. null_handle here means send() falls back to the wrapper.
-    uint16_t _frames_handle;
+    ///
+    /// Atomic like everything else written by a BLE callback and read by the drain
+    /// task. Both tasks happen to sit on core 0 and the field is aligned, so nothing
+    /// tears today; it is atomic so that the rule is "cross-task state here is
+    /// atomic" with no exception a later reader has to re-derive.
+    std::atomic<uint16_t> _frames_handle;
     /// the peer's connection handle, from onConnect(); BLE_HS_CONN_HANDLE_NONE when
     /// nothing is connected. One peer, deliberately -- see peers().
     std::atomic<uint16_t> _conn_handle;
-    bool _client_connected;
+    /// set from onConnect()/onDisconnect(); read by send() on the drain task. Atomic
+    /// for the same reason as _frames_handle.
+    std::atomic<bool> _client_connected;
     utils::timer _stats_timer;
     /// cumulative: frames handed to the stack, one per frame off the queue
     std::atomic<uint32_t> _ble_offered;

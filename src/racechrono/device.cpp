@@ -93,14 +93,23 @@ bool device::start(BLECharacteristicCallbacks* callbacks) noexcept
 void device::onConnect(BLEServer*)
 {
     infoln("Bluetooth LE client connected!");
-    _client_connected = true;
+    _client_connected.store(true, std::memory_order_relaxed);
 }
 
 void device::onDisconnect(BLEServer*)
 {
+    // Connection state is cleared here; the decoder's allow-list is deliberately not.
+    // It is not established that RaceChrono re-sends its deny-all-then-allow list on a
+    // reconnect, and a filter that reset itself to allow-all on every dropped link
+    // would put the R9's full ~1050 msg/s back on a radio that refuses above ~590,
+    // exactly when the rider wants the link back. So the filter persists to reboot.
+    //
+    // The bench pays for that: after a phone session the board is still filtered, and
+    // only the panel's flt field says so. See motocan/bluecan/firmware.md, patch 14.
+    //
     // once connection is made, BLE stops advertising, so on disconnect, start advertising again..
     infoln("Bluetooth LE client disconnected!");
-    _client_connected = false;
+    _client_connected.store(false, std::memory_order_relaxed);
     _conn_handle.store(BLE_HS_CONN_HANDLE_NONE, std::memory_order_relaxed);
     _conn_interval.store(0U, std::memory_order_relaxed);
     _mtu.store(0U, std::memory_order_relaxed);
@@ -169,10 +178,11 @@ void device::onSubscribe(BLECharacteristic* chr, ble_gap_conn_desc*, uint16_t su
     // comment exists for: ble_gatts_notify_custom() accepts that handle, returns 0, and
     // puts a notification on the air addressed to an attribute that does not exist.
     // Every counter on the board reads healthy and the phone receives nothing.
-    _frames_handle = chr->getHandle();
+    const uint16_t handle = chr->getHandle();
+    _frames_handle.store(handle, std::memory_order_relaxed);
 
     infoln("Bluetooth LE subscribe 0x%04x -> notifications %s, frame handle %u",
-        sub, on ? "on" : "off", _frames_handle);
+        sub, on ? "on" : "off", handle);
 }
 
 #endif // CONFIG_NIMBLE_ENABLED
@@ -234,7 +244,7 @@ void device::stats() noexcept
                 subscribed() ? "yes" : "no",
                 _conn_interval.load(std::memory_order_relaxed) * 1.25f,
                 _mtu.load(std::memory_order_relaxed),
-                _frames_handle);
+                _frames_handle.load(std::memory_order_relaxed));
         }
     }
 }

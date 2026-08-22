@@ -105,7 +105,10 @@ public:
     uint32_t rec() const noexcept;
 
     /**
-     * install controller driver
+     * Install the controller driver: queue, peripheral, bit timing, GPIO, ISR.
+     *
+     * @return false if the peripheral would not enter reset mode, or if the interrupt
+     *         handler could not be allocated. setup() restarts the board on either.
      */
     bool install() noexcept;
 
@@ -120,7 +123,11 @@ public:
     bool start() noexcept;
 
     /**
-     * stop controller
+     * Stop the controller: the peripheral goes back into reset mode and running()
+     * stops reporting it as up.
+     *
+     * Nothing calls this -- the controller runs from setup() until the power goes --
+     * but it does what it says now, instead of returning true and doing nothing.
      */
     bool stop() noexcept;
 

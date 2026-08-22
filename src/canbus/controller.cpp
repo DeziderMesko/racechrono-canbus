@@ -158,17 +158,27 @@ uint32_t controller::rec() const noexcept
 bool controller::install() noexcept
 {
     bootln("CAN bus starting...");
-
-    ENTER_CRITICAL();
-
     bootln("CAN bus creating frame queue...");
+
+    // Built before the critical section rather than inside it: the queue is DRAM and
+    // FreeRTOS bookkeeping, and only the peripheral registers below need the lock.
     _queue = xQueueCreateStatic(_queue_length, _queue_item_size, _queue_storage, &_static_queue);
     bootln("CAN bus frame queue created...");
+
+    // Nothing in this window may log, and nothing in it may block.
+    //
+    // logger::emit() takes a FreeRTOS mutex and then writes to USB CDC, and either can
+    // wait on another task. A wait taken here cannot end: interrupts are disabled and
+    // this spinlock is held, so the yield is never delivered and the tick that would
+    // time the wait out never fires. Patch 15 took exactly that hazard out of the
+    // logger itself; the four bootln() calls that used to sit inside this section had
+    // put it straight back one layer up, where the display task on core 0 is the other
+    // holder of the logger mutex. The milestones are logged after EXIT_CRITICAL().
+    ENTER_CRITICAL();
 
     // enable APB CLK to TWAI peripheral
     periph_module_reset(PERIPH_TWAI_MODULE);
     periph_module_enable(PERIPH_TWAI_MODULE);
-    bootln("CAN bus peripheral enabled...");
 
     twai_ll_enter_reset_mode(dev);
     if (!twai_ll_is_in_reset_mode(dev))
@@ -188,8 +198,6 @@ bool controller::install() noexcept
     twai_ll_set_rec(dev, 0);
     twai_ll_set_tec(dev, 0);
     twai_ll_set_err_warn_lim(dev, 96);
-
-    bootln("CAN bus mode reset...");
 
     // configure bus timing, acceptance filter, CLKOUT, and interrupts
     // get timing and filter from car specific decoder
@@ -219,6 +227,8 @@ bool controller::install() noexcept
 
     EXIT_CRITICAL();
 
+    bootln("CAN bus peripheral enabled...");
+    bootln("CAN bus mode reset...");
     bootln("CAN bus timings reset...");
     bootln("     APB clock: %3u MHz", getApbFrequency() / 1000000);
     bootln("        Quanta: %3u MHz", t_config.quanta_resolution_hz / 1000000);
@@ -249,7 +259,17 @@ bool controller::install() noexcept
     bootln("CAN bus GPIO pins reset...");
 
     // setup interrupt service routine
-    esp_intr_alloc(ETS_TWAI_INTR_SOURCE, ESP_INTR_FLAG_LEVEL1, isr, this, &_isr_handle);
+    //
+    // Checked, unlike upstream: without the handler the peripheral fills its receive
+    // buffer once and then goes quiet, which looks exactly like a bus with no traffic
+    // on it. Failing the install says so instead -- setup() restarts the board.
+    esp_err_t err = esp_intr_alloc(ETS_TWAI_INTR_SOURCE, ESP_INTR_FLAG_LEVEL1, isr, this, &_isr_handle);
+    if (err != ESP_OK)
+    {
+        errorln("ERROR: CAN bus interrupt handler not installed (%d)!", static_cast<int>(err));
+        return false;
+    }
+
     bootln("CAN bus interrupt handler installed...");
 
     return true;
@@ -282,6 +302,21 @@ bool controller::start() noexcept
 
 bool controller::stop() noexcept
 {
+    // The mirror of start(): reset mode halts reception, and running() stops claiming
+    // otherwise so the panel reports the controller as down. It used to return true
+    // without doing either, which is the worst of the three options.
+    //
+    // Nothing calls this today -- the firmware runs the controller from setup() until
+    // the power goes away -- so it is here to be correct rather than to be exercised.
+    ENTER_CRITICAL();
+
+    _running = false;
+    twai_ll_enter_reset_mode(dev);
+
+    EXIT_CRITICAL();
+
+    bootln("CAN bus stopped!");
+
     return true;
 }
 
@@ -385,7 +420,11 @@ void controller::isr() noexcept
             twai_ll_set_cmd_release_rx_buffer(dev);
         }
     }
-    else if (interrupts & (TWAI_LL_INTR_EI | TWAI_LL_INTR_EPI | TWAI_LL_INTR_ALI | TWAI_LL_INTR_BEI))
+    // A separate if, not an else: one interrupt word can carry RI and an error bit at
+    // the same time, and under an else that interrupt counted its frames and threw the
+    // error away. Errors are rare and this counter is read as "none at all", so the
+    // undercount fell exactly where it was least affordable.
+    if (interrupts & (TWAI_LL_INTR_EI | TWAI_LL_INTR_EPI | TWAI_LL_INTR_ALI | TWAI_LL_INTR_BEI))
     {
         _er_count.fetch_add(1, std::memory_order_relaxed);
     }
