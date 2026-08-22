@@ -96,9 +96,11 @@ const char* bus_state(uint32_t status)
 /// second, and forty times the gap between frames at the ~20 msg/s per id a
 /// recording session actually produces.
 constexpr uint32_t flow_dead_ms = 2000;
-/// the flatline pulse: one dim blip this often, so a stopped link still looks alive
-/// enough to be worth reading rather than dead enough to be mistaken for off
+/// how often the flatline's pair of flashes repeats, how long each one lasts, and
+/// how far the second trails the first
 constexpr uint32_t flatline_ms = 2000;
+constexpr uint32_t flatline_flash_ms = 90;
+constexpr uint32_t flatline_gap_ms = 240;
 /// how long a blip, a flatline pulse or a fault flash lasts
 constexpr uint32_t flash_ms = 60;
 /// what a blip falls back to between flashes. Not zero: the hue is the state, and
@@ -123,15 +125,20 @@ __always_inline uint8_t blink(uint32_t now, uint32_t period_ms) noexcept
     return (now % period_ms) < (period_ms / 2U) ? 255U : 0U;
 }
 
-/// a short flash on a dim floor, at the rate frames are actually being forwarded.
-/// Clamped at both ends: below 1 Hz it would be indistinguishable from the flatline
-/// it exists to contrast with, and above 5 Hz from a solid colour.
-__always_inline uint8_t blip(uint32_t now, uint32_t rate) noexcept
+/// the blip rate for a forwarded-frame rate. Clamped at both ends: below 1 Hz it
+/// would be indistinguishable from the flatline it exists to contrast with, and
+/// above 5 Hz from a solid colour.
+__always_inline uint8_t blip_hz(uint32_t rate) noexcept
 {
     uint32_t hz = rate / 8U;
     if (hz < 1U) { hz = 1U; }
     if (hz > 5U) { hz = 5U; }
+    return static_cast<uint8_t>(hz);
+}
 
+/// a short flash on a dim floor, at that rate
+__always_inline uint8_t blip(uint32_t now, uint8_t hz) noexcept
+{
     const uint32_t period = 1000U / hz;
     return (now % period) < flash_ms ? 255U : blip_floor;
 }
@@ -140,6 +147,37 @@ __always_inline uint8_t blip(uint32_t now, uint32_t rate) noexcept
 __always_inline uint8_t level(uint8_t component, uint8_t lvl) noexcept
 {
     return static_cast<uint8_t>((static_cast<uint32_t>(component) * lvl) / 255U);
+}
+
+/// the flatline: two flashes, at full level, every flatline_ms.
+///
+/// The first version of this was one flash_ms blip at the blips' dim floor, which is
+/// a 3% duty cycle at a quarter of a brightness already capped at 24/255 -- on the
+/// bench it read as a pixel that was simply off. That is the worst possible way for
+/// this rung to fail, because "connected and nothing is arriving" is the state that
+/// means the diagnostic connector fell off the bike. Two flashes rather than one
+/// because a single tick is hard to tell from a slow heartbeat, and this rung exists
+/// precisely to be told apart from one.
+__always_inline uint8_t flatline(uint32_t now) noexcept
+{
+    const uint32_t phase = now % flatline_ms;
+    const bool lit = phase < flatline_flash_ms
+                  || (phase >= flatline_gap_ms && phase < flatline_gap_ms + flatline_flash_ms);
+    return lit ? 255U : 0U;
+}
+
+/// what the light is on, for the DEBUG line that reports it
+const char* rung_name(uint8_t rung) noexcept
+{
+    switch (rung)
+    {
+    case 0:  return "white breathe  (CAN controller not up -- booting)";
+    case 1:  return "red solid      (bus-off)";
+    case 2:  return "amber blink    (error-passive)";
+    case 3:  return "blue breathe   (nothing subscribed)";
+    case 4:  return "yellow         (subscribed, flt ALL -- configuring)";
+    default: return "green          (subscribed, filtered -- recording)";
+    }
 }
 
 #endif // CONFIG_STATUS_LED
@@ -171,6 +209,7 @@ display::display() noexcept
     , _fault(false)
     , _flow_ms(0U)
     , _lost_prev(0U)
+    , _led_state(0xFFFFFFFFU)
     , _draw_us(0U)
     , _draw_us_max(0U)
     , _draw_us_shown(0U)
@@ -358,6 +397,7 @@ void display::stats() noexcept
             infoln("        Census ids: %d, %lu over",
                    _id_used.load(std::memory_order_acquire),
                    (unsigned long)_id_overflow);
+            report_status_led();
         }
     }
 }
@@ -482,12 +522,52 @@ void display::sample_rates() noexcept
 #endif
 }
 
+#if defined(DEBUG)
+void display::report_status_led() noexcept
+{
+#if defined(CONFIG_STATUS_LED)
+    if (_light == light_dark)
+    {
+        infoln("      Status light: off -- D0 is on the dark position");
+        return;
+    }
+
+    const uint8_t rung = static_cast<uint8_t>((_led_state >> 16) & 0xFFU);
+    const uint8_t hz = static_cast<uint8_t>((_led_state >> 8) & 0xFFU);
+
+    char pattern[32];
+    if (rung < 4U)
+    {
+        pattern[0] = '\0';
+    }
+    else if (hz == 0U)
+    {
+        snprintf(pattern, sizeof(pattern), " FLATLINE -- no frames 2 s+");
+    }
+    else
+    {
+        snprintf(pattern, sizeof(pattern), " blips %u Hz", (unsigned)hz);
+    }
+
+    infoln("      Status light: %s%s%s", rung_name(rung), pattern,
+           _fault ? "  + FAULT flash" : "");
+#endif
+}
+#endif
+
 void display::update_status_led() noexcept
 {
 #if defined(CONFIG_STATUS_LED)
     if (_light == light_dark)
     {
         LED.status_end();
+#if defined(DEBUG)
+        if (_led_state != 0xFFFFFFFFU)
+        {
+            _led_state = 0xFFFFFFFFU;
+            report_status_led();
+        }
+#endif
         return;
     }
 
@@ -507,6 +587,9 @@ void display::update_status_led() noexcept
     uint8_t g;
     uint8_t b;
     uint8_t lvl;
+    uint8_t rung;
+    /// blip rate actually used, or 0 for a rung that is not blipping
+    uint8_t hz = 0U;
 
     if (!running)
     {
@@ -515,6 +598,7 @@ void display::update_status_led() noexcept
         // because a failure there restarts the board -- so read it as booting.
         r = 255; g = 255; b = 255;
         lvl = breathe(now, 2000U);
+        rung = 0U;
     }
     else if (status & TWAI_LL_STATUS_BS)
     {
@@ -523,11 +607,13 @@ void display::update_status_led() noexcept
         // assumption is wrong: two comparisons is a fair price.
         r = 255; g = 0; b = 0;
         lvl = 255;
+        rung = 1U;
     }
     else if (status & TWAI_LL_STATUS_ES)
     {
         r = 255; g = 140; b = 0;
         lvl = blink(now, 1000U);
+        rung = 2U;
     }
     else if (!RCDEV.subscribed())
     {
@@ -537,6 +623,7 @@ void display::update_status_led() noexcept
         // separates them for anyone standing over the board.
         r = 0; g = 0; b = 255;
         lvl = breathe(now, 2000U);
+        rung = 3U;
     }
     else
     {
@@ -549,12 +636,19 @@ void display::update_status_led() noexcept
         r = unfiltered ? 255 : 0;
         g = 255;
         b = 0;
+        rung = unfiltered ? 4U : 5U;
 
         // Slow and stopped are the two states no other indicator on this board can
         // tell apart, and a diagnostic connector that fell off is the second one.
-        lvl = (now - _flow_ms) >= flow_dead_ms
-            ? ((now % flatline_ms) < flash_ms ? blip_floor : 0U)
-            : blip(now, _fwd_rate);
+        if ((now - _flow_ms) >= flow_dead_ms)
+        {
+            lvl = flatline(now);
+        }
+        else
+        {
+            hz = blip_hz(_fwd_rate);
+            lvl = blip(now, hz);
+        }
     }
 
     // The fault is an overlay, not a rung. Made a rung it would replace the hue and
@@ -568,6 +662,18 @@ void display::update_status_led() noexcept
     }
 
     LED.status(level(r, lvl), level(g, lvl), level(b, lvl));
+
+#if defined(DEBUG)
+    const uint32_t state = (static_cast<uint32_t>(rung) << 16)
+                         | (static_cast<uint32_t>(hz) << 8)
+                         | (_fault ? 1U : 0U);
+
+    if (state != _led_state)
+    {
+        _led_state = state;
+        report_status_led();
+    }
+#endif
 #endif
 }
 
@@ -901,6 +1007,7 @@ display::display() noexcept
     , _fault(false)
     , _flow_ms(0U)
     , _lost_prev(0U)
+    , _led_state(0xFFFFFFFFU)
     , _draw_us(0U)
     , _draw_us_max(0U)
     , _draw_us_shown(0U)
@@ -929,6 +1036,9 @@ void display::refresh() noexcept {}
 void display::poll_buttons() noexcept {}
 void display::sample_rates() noexcept {}
 void display::update_status_led() noexcept {}
+#if defined(DEBUG)
+void display::report_status_led() noexcept {}
+#endif
 void display::field(int, uint8_t, uint16_t, int, const char*) noexcept {}
 void display::row(int, uint16_t, const char*, ...) noexcept {}
 void display::wipe() noexcept {}

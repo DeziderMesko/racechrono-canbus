@@ -117,6 +117,20 @@ private:
      */
     void update_status_led() noexcept;
 
+    /**
+     * Say on the console what colour the light is on, and why.
+     *
+     * DEBUG only, and called from two places: the stats cadence, and the moment the
+     * light changes rung. The second is what makes it usable as an instrument --
+     * plug a phone in and the line arrives with it, rather than up to five seconds
+     * later. See tools/led-state.py in motocan.
+     */
+#if defined(DEBUG)
+    void report_status_led() noexcept;
+#else
+    void report_status_led() noexcept {}
+#endif
+
     /// draw one line, but only if its text differs from what is already on the glass
     void field(int y, uint8_t size, uint16_t color, int slot, const char* text) noexcept;
     /// format one content row, space-padded to the full width so the previous line
@@ -199,6 +213,12 @@ private:
     /// refusals during one are the documented behaviour rather than a fault, and the
     /// count they leave behind must not arm the light for the session after it.
     uint32_t _lost_prev;
+    /// what the light is doing, packed so a change is one comparison:
+    /// rung << 16 | hz << 8 | fault. The pixel is the one part of this firmware a
+    /// shell cannot see at all -- the panel at least reports its own repaint cost --
+    /// so in a DEBUG build it says what colour it is on, both on the stats cadence
+    /// and the moment it changes.
+    uint32_t _led_state;
     uint32_t _draw_us;
     uint32_t _draw_us_max;
     /// _draw_us as of the last one-second sample. What the panel shows has to change
