@@ -25,6 +25,7 @@
 #include "../canbus/decoder.hpp"
 #include "../led/led.hpp"
 #include "../logging/logging.hpp"
+#include "../power/power.hpp"
 #include "../racechrono/device.hpp"
 
 #include "display.hpp"
@@ -93,6 +94,19 @@ const char* bus_state(uint32_t status)
 /// saturation reads closer to electric blue than the calmer navy the name is meant
 /// to evoke sitting next to a white or yellow status word.
 constexpr uint16_t color_blue_dim = 0x1A96;
+
+/// "we do not know", as a colour. Grey rather than yellow: a missing fuel gauge is
+/// not a warning about the supply, it is the absence of a reading, and a yellow one
+/// would read as a low battery from across a garage.
+constexpr uint16_t color_grey_dim = 0x8410;
+
+/// where the supply readout stops being green, and where it turns red. A 1S LiPo is
+/// full at 4.2 V, spends most of a session between 3.9 and 3.7, and is close to done
+/// at 3.5. On USB with no battery fitted the same rail reads the charger's own
+/// output, comfortably above both, so the green band covers "fed by the bike" as
+/// well as "battery with plenty left" -- which is the point of showing it at all.
+constexpr uint16_t supply_mv_warn = 3700;
+constexpr uint16_t supply_mv_low = 3500;
 
 #if defined(CONFIG_STATUS_LED)
 
@@ -336,6 +350,12 @@ void display::run() noexcept
     LED.status_begin();
 #endif
 
+    // The fuel gauge, for the same reason the panel is initialised here and not in
+    // start(): it hangs off TFT_I2C_POWER, which this task has just driven high, and
+    // one task owning every peripheral on core 0 is the rule this module exists to
+    // keep. Sampled from sample_rates() on the 1 Hz tick thereafter.
+    PWR.begin();
+
     _rate_ms = millis();
 
     uint32_t last_paint = 0;
@@ -405,6 +425,31 @@ void display::stats() noexcept
             infoln("        Census ids: %d, %lu over",
                    _id_used.load(std::memory_order_acquire),
                    (unsigned long)_id_overflow);
+
+            // The supply, on the console for the same reason the repaint cost is:
+            // the panel is the one instrument a shell cannot read, and this is the
+            // number that explains a board that rebooted while nobody was watching.
+            if (PWR.present())
+            {
+                const unsigned mv = PWR.millivolts();
+                const int rate = PWR.rate_tenths();
+                // Raw, both halves, whatever cell() thinks: the console is the
+                // instrument the display's own rule is checked against, and a
+                // percentage suppressed on the glass is exactly the number worth
+                // reading here.
+                infoln("            Supply: %u.%03u V, %u.%u%%, %s%d.%d%%/hr%s",
+                       mv / 1000U, mv % 1000U,
+                       (unsigned)(PWR.soc_tenths() / 10U),
+                       (unsigned)(PWR.soc_tenths() % 10U),
+                       rate < 0 ? "-" : "",
+                       (rate < 0 ? -rate : rate) / 10,
+                       (rate < 0 ? -rate : rate) % 10,
+                       PWR.cell() ? "" : "  (no CONFIG_CELL_FITTED: charge and rate are the charger's rail)");
+            }
+            else
+            {
+                infoln("            Supply: no fuel gauge answering");
+            }
             report_status_led();
         }
     }
@@ -485,6 +530,11 @@ void display::sample_rates() noexcept
     }
 
     _draw_us_shown = _draw_us;
+
+    // Three 2-byte I2C reads, ~150 us at 400 kHz, on the tick that is already the
+    // slow one. The cell moves over minutes, so anything faster would be spending
+    // core 0 to watch a number that has not changed.
+    PWR.sample();
 
     uint32_t heap = ESP.getFreeHeap();
     if (heap < _min_heap)
@@ -949,9 +999,73 @@ void display::page_bus() noexcept
     // and ble (a 3-letter label that used a narrower %8lu field) put their leading
     // digit one column apart, which is what made the BLE row's value look shifted.
     constexpr int label_w = 6;
+
+    // The supply, at the one end of a row with room for it. Every other row on this
+    // page runs to the edge, and the footer's three spare columns are not twelve.
+    // It belongs here anyway: the rest of this row is "what state is the hardware
+    // in", and so is this.
+    //
+    // What the gauge reads is the BAT rail -- the cell if one is fitted, the
+    // charger's output if not -- and never the 5 V the bike's USB outlet supplies;
+    // this board brings VBUS out to a pad and to nothing else. The trailing
+    // character is what covers that: '+' is a cell being charged, so the outlet is
+    // live, and '-' is the device running on its own battery, which is what the
+    // ignition going off looks like from in here. See power::gauge.
+    char supply[16];
+    uint16_t supply_color;
+
+    if (PWR.present())
+    {
+        const unsigned mv = PWR.millivolts();
+
+        // Exactly twelve columns wide either way -- "       4.10V" with no cell
+        // fitted, " 4.06V  82%+" with one. Nothing here may grow, because the state
+        // word to its left is padded to a fixed width precisely so this lands on the
+        // same column every pass.
+        //
+        // The voltage is unconditional and the percentage is not, because with an
+        // empty battery jack only one of them is about anything. The gauge cannot
+        // tell whether a cell is fitted -- on the bench it reports 100.0% and
+        // discharging at 22%/hr for a rail that is not moving -- so it is not asked
+        // to. See CONFIG_CELL_FITTED, and power::gauge for the two runtime tests that
+        // were tried against the board and did not survive it.
+        if (PWR.cell())
+        {
+            snprintf(supply, sizeof(supply), " %u.%02uV%4u%%%c",
+                     mv / 1000U, (mv % 1000U) / 10U,
+                     static_cast<unsigned>(PWR.soc_tenths() / 10U), PWR.flow());
+        }
+        else
+        {
+            // Right-aligned, so it ends on column 39 with the values on the rows
+            // below it rather than floating in the middle of the row.
+            char volts[8];
+            snprintf(volts, sizeof(volts), "%u.%02uV", mv / 1000U, (mv % 1000U) / 10U);
+            snprintf(supply, sizeof(supply), "%12s", volts);
+        }
+
+        supply_color = mv < supply_mv_low  ? ST77XX_RED
+                     : mv < supply_mv_warn ? ST77XX_YELLOW
+                                           : ST77XX_GREEN;
+    }
+    else
+    {
+        snprintf(supply, sizeof(supply), " bat n/a");
+        supply_color = color_grey_dim;
+    }
+
+    // where the supply readout starts: "CAN 500k LISTEN-ONLY " is 21 columns and the
+    // state word after it is padded to 7, the width of BUS-OFF
+    constexpr int supply_col = 28;
+
     int col = 0;
     int y = content_y + 0 * row_h;
-    seg_fill(y, col, state_color, "CAN 500k LISTEN-ONLY %s", state);
+    // "%-7s" rather than "%s": the readout after it has to start at the same column
+    // whatever the bus is doing -- see the column-change comment on field() for what
+    // a moving anchor does to the slot that follows it.
+    seg(y, col, state_color, "CAN 500k LISTEN-ONLY %-7s", state);
+    col = supply_col;
+    seg_fill(y, col, supply_color, "%s", supply);
 
     col = 0;
     y = content_y + 1 * row_h;

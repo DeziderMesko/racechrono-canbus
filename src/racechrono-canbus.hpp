@@ -108,7 +108,27 @@
 /// a status light for the chain -- bus, queue, radio, phone. See
 /// motocan/bluecan/firmware.md, patch 16.
 #define CONFIG_STATUS_LED 1
+/// ...and a MAX17048 fuel gauge on the I2C bus at 0x36, watching the BAT rail. It is
+/// the only supply voltage anything on this board can measure -- VBUS goes to a pad
+/// and nowhere else -- so it is what the panel reports, and the sign of its charge
+/// rate is what says whether the bike is still feeding the device. See
+/// motocan/bluecan/firmware.md, patch 17.
+#define CONFIG_FUEL_GAUGE 1
 #endif
+
+/// define when a cell is actually plugged into the JST jack.
+///
+/// The gauge has no battery-presence bit, and with the jack empty it models the
+/// charger's rail as though it were a cell: measured on the bench, 4.10 V, 100.0%
+/// charged, discharging at 22%/hr, with the voltage not moving. Taken at face value
+/// that reads "running on battery" while the board sits on USB -- backwards, and the
+/// configuration the bike uses today. Two runtime tests for it were tried and both
+/// failed; see motocan/bluecan/firmware.md, patch 17.
+///
+/// So the panel shows the voltage, which is true either way, and shows the state of
+/// charge and the charge/discharge marker only when this says there is something to
+/// report them about. **Untested**: nothing has been measured with a cell fitted yet.
+// #define CONFIG_CELL_FITTED 1
 
 // ESP32 Dev Module
 #if defined(ARDUINO_ESP32_DEV)
