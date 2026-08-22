@@ -71,8 +71,10 @@ constexpr uint32_t refresh_slow_ms = 1000;
 /// button -- a quick press between two repaints would simply not exist.
 constexpr uint32_t poll_ms = 25;
 
-/// bytes, not words: ESP-IDF's StackType_t is a byte. The bench sketch's display
-/// task ran the same drawing code in 4 KB with ~2.2 KB to spare.
+/// bytes, not words: ESP-IDF's StackType_t is a byte. This panel runs in 4 KB with
+/// **1912 B** still free, measured on the board 2026-08-22 -- the ~2.2 KB this used to
+/// quote was the bench sketch's simpler page. Current values live in
+/// motocan/bluecan/numbers.md.
 constexpr uint32_t stack_size = 4096;
 StaticTask_t task_buffer;
 StackType_t task_stack[stack_size];
@@ -246,7 +248,8 @@ display::display() noexcept
     , _cache{}
     , _cache_color{}
     , _cache_col{}
-    , _slot(0)
+    , _slot_y(-1)
+    , _slot_n(0)
 {
 }
 
@@ -738,12 +741,12 @@ void display::update_status_led() noexcept
 
 void display::field(int y, uint8_t size, uint16_t color, int slot, const char* text, int col) noexcept
 {
-    // Every drawable line comes through here, so this is the one place the slot pools
-    // can be checked at all. Pool B's counter just increments -- a page that grows a
-    // few segments walks off the end of _cache and memcpys into _cache_color,
-    // _cache_col and _slot, which corrupts the change detection rather than failing
-    // where anyone would look. An abort on the first repaint is the cheaper way to
-    // find that out.
+    // Every drawable line comes through here, so this is the one place a slot can be
+    // checked at all. slot_for() already bounds the seg() region row by row; this
+    // catches a hand-assigned slot that has drifted out of range, which would memcpy
+    // off the end of _cache into _cache_color and _cache_col and corrupt the change
+    // detection rather than failing where anyone would look. An abort on the first
+    // repaint is the cheaper way to find that out.
     RCASSERT(slot >= 0 && slot < cache_slots);
 
     char* cache = _cache[slot];
@@ -831,6 +834,30 @@ void display::row(int idx, uint16_t color, const char* fmt, ...) noexcept
     field(content_y + idx * row_h, 1, color, idx + 1, buf);
 }
 
+int display::slot_for(int y) noexcept
+{
+    // A row owns segs_per_row consecutive slots, indexed by the order its segments are
+    // drawn in. The alternative -- one counter running across the whole page -- meant a
+    // row that grew or lost a segment renumbered every row after it, and the change
+    // detection then compared each of those rows against a neighbour's text. Nothing
+    // reports that: the counters stay healthy and the glass goes quietly wrong.
+    if (y != _slot_y)
+    {
+        _slot_y = y;
+        _slot_n = 0;
+    }
+
+    int idx = (y - content_y) / row_h;
+
+    // Only content rows reach here; the header and the footer have hand-assigned slots.
+    // Both asserts are the shape-change alarm this scheme exists to provide: one for a
+    // segment drawn outside the content area, one for a row that has outgrown its range.
+    RCASSERT(idx >= 0 && idx < ui::display::cache_rows);
+    RCASSERT(_slot_n < ui::display::segs_per_row);
+
+    return slot_row_base + idx * segs_per_row + _slot_n++;
+}
+
 void display::seg(int y, int& col, uint16_t color, const char* fmt, ...) noexcept
 {
     char buf[cache_len];
@@ -840,8 +867,7 @@ void display::seg(int y, int& col, uint16_t color, const char* fmt, ...) noexcep
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
 
-    int slot = _slot++;
-    field(y, 1, color, slot, buf, col);
+    field(y, 1, color, slot_for(y), buf, col);
     col += static_cast<int>(strlen(buf));
 }
 
@@ -877,8 +903,7 @@ void display::seg_fill(int y, int& col, uint16_t color, const char* fmt, ...) no
     }
     buf[avail] = '\0';
 
-    int slot = _slot++;
-    field(y, 1, color, slot, buf, col);
+    field(y, 1, color, slot_for(y), buf, col);
     col += avail;
 }
 
@@ -902,7 +927,12 @@ void display::wipe() noexcept
 
 void display::refresh() noexcept
 {
-    _slot = slot_dynamic_base;
+    // display.cpp owns the row geometry and display.hpp owns the cache map; they have to
+    // agree, and this is the cheapest place to say so.
+    static_assert(rows <= cache_rows, "a content row has no cache slots of its own");
+
+    _slot_y = -1;
+    _slot_n = 0;
 
     // Header: the one line that is the same on every page, because it answers the
     // question asked most often -- is the phone actually getting anything.
@@ -958,8 +988,8 @@ void display::refresh() noexcept
     }
     state_buf[n] = '\0';
 
-    field(0, 2, color_blue_dim, _slot++, "bluecan", 0);
-    field(0, 2, state_c, _slot++, state_buf, wordmark_cols);
+    field(0, 2, color_blue_dim, slot_header_base, "bluecan", 0);
+    field(0, 2, state_c, slot_header_base + 1, state_buf, wordmark_cols);
 
     switch (_page)
     {
@@ -1338,7 +1368,8 @@ display::display() noexcept
     , _cache{}
     , _cache_color{}
     , _cache_col{}
-    , _slot(0)
+    , _slot_y(-1)
+    , _slot_n(0)
 {
 }
 

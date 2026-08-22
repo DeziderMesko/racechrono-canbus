@@ -143,14 +143,15 @@ private:
     /// draw one coloured segment of a row at column *col*, sized for content rows
     /// (text size 1), and advance *col* past it. Used to give a row's label and its
     /// value different colours without hand-assigning a cache slot to each one: the
-    /// slot is whichever one is next in _slot, which is reset to the same starting
-    /// value at the top of every refresh() -- so as long as a page draws its segments
-    /// in the same order every pass, each one lands on the same slot every time.
+    /// slot comes from slot_for(), which numbers segments within their own row, so a
+    /// row that changes shape cannot move any other row's slots.
     void seg(int y, int& col, uint16_t color, const char* fmt, ...) noexcept __attribute__((format(printf, 5, 6)));
     /// like seg(), but pads its text with spaces out to column *cols* first. For the
     /// last segment on a row, so a value that shrinks cannot leave the previous,
     /// longer value's tail on the glass.
     void seg_fill(int y, int& col, uint16_t color, const char* fmt, ...) noexcept __attribute__((format(printf, 5, 6)));
+    /// the cache slot the next segment on row *y* owns -- see the cache map below
+    int slot_for(int y) noexcept;
     /// blank the content area and invalidate every cache slot
     void wipe() noexcept;
 
@@ -185,17 +186,29 @@ private:
     static constexpr int id_slots = 20;
     /// recent frames kept for the LAST page
     static constexpr int ring_slots = 6;
-    /// change-detection cache: one entry per drawable line, split into two pools.
-    /// Slots 1..9 and cache_slots-1 are hand-assigned to page_ids(), page_last() and
-    /// the footer, which each draw one colour per line and can keep a fixed slot per
-    /// row. Slots from slot_dynamic_base up are page_bus() and the header's pool:
-    /// those rows mix a yellow label with a white or status-coloured value, so they
-    /// are built from a variable number of seg()/seg_fill() calls instead, each
-    /// claiming the next free slot in _slot. That counter resets to slot_dynamic_base
-    /// at the top of every refresh(), so a pool-B slot is stable across repaints only
-    /// because the sequence of seg() calls that produces it never changes shape.
-    static constexpr int slot_dynamic_base = 20;
-    static constexpr int cache_slots = 70;
+    /// change-detection cache: one entry per drawable line, in fixed regions.
+    ///
+    ///     1 .. cache_rows                              page_ids()/page_last(), via row()
+    ///     slot_header_base, +1                         the header's two segments
+    ///     slot_row_base + row * segs_per_row + n       the nth seg() on content row
+    ///     cache_slots - 1                              the footer
+    ///
+    /// page_ids() and page_last() draw one colour per line and keep a fixed slot per
+    /// row. page_bus() and the header cannot: they mix a yellow label with a white or
+    /// status-coloured value, so a row is a variable number of seg()/seg_fill() calls.
+    ///
+    /// Those used to claim slots from a single running counter, and that was a trap.
+    /// A page that grew or dropped one segment shifted every slot after it by one, so
+    /// each following row silently began diffing itself against another row's text --
+    /// stale characters on the glass, with every counter healthy. field()'s RCASSERT
+    /// catches walking off the end of the cache; it cannot catch a reshuffle inside
+    /// it. Giving each row a fixed range confines a shape change to the row that made
+    /// it, and slot_for()'s assert then names that row.
+    static constexpr int cache_rows = 9;       //!< content rows; `rows` in display.cpp
+    static constexpr int segs_per_row = 10;    //!< seg() calls one row may make
+    static constexpr int slot_header_base = 10;
+    static constexpr int slot_row_base = slot_header_base + 2;
+    static constexpr int cache_slots = slot_row_base + cache_rows * segs_per_row + 1;
     static constexpr int cache_len = 44;
 
     // --- written by the drain task, read by the display task. Both live on core 0
@@ -270,9 +283,10 @@ private:
     /// the column each slot was last drawn at, so a slot whose own text and colour are
     /// unchanged still redraws when an earlier slot on the same row shifts it sideways
     int _cache_col[cache_slots];
-    /// next free slot in pool B (see slot_dynamic_base), reset at the top of every
-    /// refresh()
-    int _slot;
+    /// the content row slot_for() is currently handing out slots on, and how many it
+    /// has handed out on it. Reset at the top of every refresh().
+    int _slot_y;
+    int _slot_n;
 };
 
 } // namespace ui
