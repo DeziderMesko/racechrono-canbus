@@ -32,8 +32,13 @@ logger& logger::get() noexcept
 
 logger::logger() noexcept
     : _log_level(log_level::boot)
-    , _lock(portMUX_INITIALIZER_UNLOCKED)
+    , _lock(nullptr)
+    , _lock_buffer{}
 {
+    // Statically allocated: the logger is a function-local static, so the first
+    // log call constructs it, and that call can come from any task on either
+    // core. A static mutex cannot fail for want of heap at that moment.
+    _lock = xSemaphoreCreateMutexStatic(&_lock_buffer);
 }
 
 logger::~logger() noexcept

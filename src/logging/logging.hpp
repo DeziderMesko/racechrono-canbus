@@ -24,6 +24,7 @@
 #include "../racechrono-canbus.hpp"
 
 #include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 #include <cstdio>
 #include <utility>
@@ -69,6 +70,13 @@ public:
     void set_level(log_level level) noexcept { _log_level = level; }
 
     /**
+     * how long a log call will wait for another task to finish its line before
+     * giving up and dropping this one. A logger that blocks a task for longer
+     * than this is worse than a logger that loses a line.
+     */
+    static constexpr TickType_t lock_wait = pdMS_TO_TICKS(50);
+
+    /**
      * log message using printf-style formatting
      */
     template <typename ...TArgs>
@@ -76,12 +84,7 @@ public:
     {
         if (level <= _log_level)
         {
-            char buf[128];
-            size_t len = snprintf(buf, sizeof(buf), fmt, std::forward<TArgs>(args)...);
-            portENTER_CRITICAL(&_lock);
-            Serial.write(buf, len);
-            Serial.flush();  // when writing to Serial on different cores, flush() seems required
-            portEXIT_CRITICAL(&_lock);
+            emit(false, fmt, std::forward<TArgs>(args)...);
         }
     }
 
@@ -93,22 +96,89 @@ public:
     {
         if (level <= _log_level)
         {
-            char buf[128];
-            size_t len = snprintf(buf, sizeof(buf), fmt, std::forward<TArgs>(args)...);
-            portENTER_CRITICAL(&_lock);
-            Serial.write(buf, len);
-            Serial.println();
-            Serial.flush();  // when writing to Serial on different cores, flush() seems required
-            portEXIT_CRITICAL(&_lock);
+            emit(true, fmt, std::forward<TArgs>(args)...);
         }
     }
 
 private:
     explicit logger() noexcept;
 
+    /**
+     * Format one message and hand it to Serial as a single write.
+     *
+     * Three rules hold this together, and each one replaces something that used to
+     * be here:
+     *
+     * 1. **No critical section.** This used to wrap the write in
+     *    portENTER_CRITICAL/portEXIT_CRITICAL. On this board Serial is USB CDC:
+     *    USBCDC::write takes a FreeRTOS semaphore, and then spins on
+     *    tud_cdc_n_write_available() until the *host* reads, for up to
+     *    tx_timeout_ms. Doing that with interrupts disabled stops the USB
+     *    interrupt that would drain the buffer, so the wait can only end by
+     *    timing out -- 250 ms by default, against a 300 ms interrupt watchdog.
+     *    It also freezes every other task on that core for the duration, and it
+     *    calls into TinyUSB from a context TinyUSB does not expect.
+     *
+     * 2. **One write() per line**, newline included, instead of write() +
+     *    println(). That is what the removed flush() was really buying: a line
+     *    from one core could not be cut in half by a line from the other. Both
+     *    USBCDC and HardwareSerial hold their own lock for the whole of a single
+     *    write(), so a whole line goes out whole. flush() itself only waited for
+     *    the host and is not needed -- write() already hands the bytes to the
+     *    USB stack.
+     *
+     * 3. **A mutex, not a spinlock**, and one that gives up. It bounds the wait
+     *    at lock_wait and lets the holder be preempted, which a spinlock with
+     *    interrupts off cannot do.
+     *
+     * Not called from an interrupt handler: a log call inside the CAN ISR would
+     * be a bug, and dropping the message is a better way to say so than the
+     * assertion a blocking take would fire.
+     */
+    template <typename ...TArgs>
+    void emit(bool newline, const char* fmt, TArgs&& ...args) noexcept
+    {
+        if (xPortInIsrContext())
+        {
+            return;
+        }
+
+        // Two bytes held back for the newline, one for the terminator snprintf
+        // always writes.
+        char buf[buf_size];
+        constexpr size_t cap = buf_size - 2;
+
+        int n = snprintf(buf, cap, fmt, std::forward<TArgs>(args)...);
+        if (n < 0)
+        {
+            return;
+        }
+
+        // snprintf returns what it *would* have written. Taking that as a length
+        // reads off the end of buf for any message longer than the buffer, which
+        // is a stack overread on a board with no MMU to catch it.
+        size_t len = static_cast<size_t>(n) < cap - 1 ? static_cast<size_t>(n) : cap - 1;
+
+        if (newline)
+        {
+            buf[len++] = '\r';
+            buf[len++] = '\n';
+        }
+
+        if (_lock == nullptr || xSemaphoreTake(_lock, lock_wait) != pdTRUE)
+        {
+            return;
+        }
+        Serial.write(reinterpret_cast<const uint8_t*>(buf), len);
+        xSemaphoreGive(_lock);
+    }
+
 private:
+    static constexpr size_t buf_size = 128;
+
     log_level _log_level;
-    portMUX_TYPE _lock;
+    SemaphoreHandle_t _lock;
+    StaticSemaphore_t _lock_buffer;
 };
 
 } // namespace logging

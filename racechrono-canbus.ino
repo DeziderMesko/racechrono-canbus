@@ -57,6 +57,15 @@ void setup()
 
     Serial.begin(115200);
 
+#if ARDUINO_USB_CDC_ON_BOOT
+    // The core defaults this to 250 ms, and a USB CDC write blocks until the host
+    // reads or the timeout expires. 250 ms of a blocked drain task is 250 ms of
+    // frames piling up in a queue that holds 2000, for the sake of a debug line.
+    // 20 ms is far more than a console that is actually reading ever needs, and a
+    // console that is not reading should cost a truncated line, not a backlog.
+    Serial.setTxTimeoutMs(20);
+#endif
+
     delay(1500);
     Serial.print("Starting up on core ");
     Serial.println(xPortGetCoreID());
