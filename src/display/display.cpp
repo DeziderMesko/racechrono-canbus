@@ -930,14 +930,21 @@ void display::page_bus() noexcept
     // each row is seg_fill() so a value that shrinks cannot leave a longer previous
     // one's tail on the glass. See the slot_dynamic_base comment in display.hpp for
     // why none of these calls need an explicit slot number.
+    //
+    // Each row's leading label is printed "%-6s": 6 is one past "queue", the longest
+    // of them, so every row's first value starts at the same column regardless of its
+    // own label's length. Without this, rx/fwd (2- and 3-letter labels, a %9lu field)
+    // and ble (a 3-letter label that used a narrower %8lu field) put their leading
+    // digit one column apart, which is what made the BLE row's value look shifted.
+    constexpr int label_w = 6;
     int col = 0;
     int y = content_y + 0 * row_h;
     seg_fill(y, col, state_color, "CAN 500k LISTEN-ONLY %s", state);
 
     col = 0;
     y = content_y + 1 * row_h;
-    seg(y, col, ST77XX_YELLOW, "rx");
-    seg_fill(y, col, ST77XX_WHITE, "  %9lu %5lu/s", (unsigned long)c.frames, (unsigned long)_rx_rate);
+    seg(y, col, ST77XX_YELLOW, "%-*s", label_w, "rx");
+    seg_fill(y, col, ST77XX_WHITE, "%9lu %5lu/s", (unsigned long)c.frames, (unsigned long)_rx_rate);
 
     // What the app asked for, next to what it got. The IDS page says which ids crossed
     // the filter, but not whether the board is filtering at all -- and "the phone never
@@ -961,8 +968,8 @@ void display::page_bus() noexcept
 
     col = 0;
     y = content_y + 2 * row_h;
-    seg(y, col, ST77XX_YELLOW, "fwd");
-    seg(y, col, ST77XX_WHITE, " %9lu %5lu/s", (unsigned long)c.forwarded, (unsigned long)_fwd_rate);
+    seg(y, col, ST77XX_YELLOW, "%-*s", label_w, "fwd");
+    seg(y, col, ST77XX_WHITE, "%9lu %5lu/s", (unsigned long)c.forwarded, (unsigned long)_fwd_rate);
     seg(y, col, ST77XX_YELLOW, " flt");
     seg_fill(y, col, flt_color, " %s", flt_txt);
 
@@ -983,9 +990,12 @@ void display::page_bus() noexcept
 
     col = 0;
     y = content_y + 3 * row_h;
-    seg(y, col, ST77XX_CYAN, "ble");
+    seg(y, col, ST77XX_CYAN, "%-*s", label_w, "ble");
+    // Same %9lu/%5lu widths as rx/fwd above -- this used to be %8lu/%4lu, one column
+    // narrower, which is exactly what put this row's own value one column to the left
+    // of theirs.
     seg(y, col, connected ? ST77XX_CYAN : ST77XX_YELLOW,
-        " %8lu %4lu/s", (unsigned long)RCDEV.frames(), (unsigned long)_ble_rate);
+        "%9lu %5lu/s", (unsigned long)RCDEV.frames(), (unsigned long)_ble_rate);
     seg(y, col, ST77XX_CYAN, " lost");
     seg(y, col, ble_lost ? ST77XX_RED : ST77XX_CYAN, " %lu", ble_lost);
     seg(y, col, ST77XX_CYAN, " p");
@@ -993,8 +1003,8 @@ void display::page_bus() noexcept
 
     col = 0;
     y = content_y + 4 * row_h;
-    seg(y, col, ST77XX_YELLOW, "queue");
-    seg(y, col, c.queued > (c.capacity / 2) ? ST77XX_YELLOW : ST77XX_WHITE, " %4lu", (unsigned long)c.queued);
+    seg(y, col, ST77XX_YELLOW, "%-*s", label_w, "queue");
+    seg(y, col, c.queued > (c.capacity / 2) ? ST77XX_YELLOW : ST77XX_WHITE, "%4lu", (unsigned long)c.queued);
     seg(y, col, ST77XX_YELLOW, " peak");
     seg_fill(y, col, ST77XX_WHITE, " %4lu/%lu", (unsigned long)c.peak, (unsigned long)c.capacity);
 
@@ -1004,8 +1014,8 @@ void display::page_bus() noexcept
 
     col = 0;
     y = content_y + 5 * row_h;
-    seg(y, col, ST77XX_YELLOW, "drop");
-    seg(y, col, drop_color, " %lu", (unsigned long)c.dropped);
+    seg(y, col, ST77XX_YELLOW, "%-*s", label_w, "drop");
+    seg(y, col, drop_color, "%lu", (unsigned long)c.dropped);
     seg(y, col, ST77XX_YELLOW, "  err");
     seg_fill(y, col, drop_color, " %lu", (unsigned long)c.errors);
 
@@ -1016,8 +1026,8 @@ void display::page_bus() noexcept
 
     col = 0;
     y = content_y + 6 * row_h;
-    seg(y, col, ST77XX_YELLOW, "ext");
-    seg(y, col, anomaly_color, " %lu", (unsigned long)c.extended);
+    seg(y, col, ST77XX_YELLOW, "%-*s", label_w, "ext");
+    seg(y, col, anomaly_color, "%lu", (unsigned long)c.extended);
     seg(y, col, ST77XX_YELLOW, " rtr");
     seg(y, col, anomaly_color, " %lu", (unsigned long)c.remote);
     seg(y, col, ST77XX_YELLOW, " tec");
@@ -1027,36 +1037,39 @@ void display::page_bus() noexcept
 
     UBaseType_t stack = _handle ? uxTaskGetStackHighWaterMark(_handle) : 0;
 
+    // Two spaces before "min" and "stk" rather than one -- this is the busiest row on
+    // the page (three label/value pairs in 40 columns) and the tighter spacing read
+    // as a run-on: "min 147k303k 1872" rather than three distinguishable fields.
     col = 0;
     y = content_y + 7 * row_h;
-    seg(y, col, ST77XX_YELLOW, "heap");
-    seg(y, col, ST77XX_WHITE, " %luk", (unsigned long)(ESP.getFreeHeap() / 1024));
-    seg(y, col, ST77XX_YELLOW, " min");
+    seg(y, col, ST77XX_YELLOW, "%-*s", label_w, "heap");
+    seg(y, col, ST77XX_WHITE, "%luk", (unsigned long)(ESP.getFreeHeap() / 1024));
+    seg(y, col, ST77XX_YELLOW, "  min");
     seg(y, col, ST77XX_WHITE, " %luk", (unsigned long)(_min_heap / 1024));
-    seg(y, col, ST77XX_YELLOW, " stk");
+    seg(y, col, ST77XX_YELLOW, "  stk");
     seg_fill(y, col, ST77XX_WHITE, " %lu", (unsigned long)stack);
 
     // What a repaint costs, on the glass it costs it on. A full repaint of this panel
     // is ~198 ms and a change-detected one ~160 us; if max ever climbs back towards
     // the former, the change detection has stopped working. Shown in milliseconds --
-    // microsecond precision is noise nobody standing over the board can read -- and
-    // uptime as hhh:mm:ss rather than a raw second count that stops being legible
-    // within the first ride.
+    // microsecond precision is noise nobody standing over the board can read.
     unsigned long draw_shown_ds = (unsigned long)_draw_us_shown / 100UL;
     unsigned long draw_max_ds = (unsigned long)_draw_us_max / 100UL;
+    // mm:ss, not hhh:mm:ss -- this row has no room left for hours once draw and max
+    // are spelled out in full, and a ride is over long before uptime needs a third
+    // field anyway.
     unsigned long up_s = millis() / 1000UL;
-    unsigned long up_h = up_s / 3600UL;
-    unsigned long up_m = (up_s % 3600UL) / 60UL;
+    unsigned long up_m = up_s / 60UL;
     unsigned long up_sec = up_s % 60UL;
 
     col = 0;
     y = content_y + 8 * row_h;
-    seg(y, col, ST77XX_YELLOW, "draw");
-    seg(y, col, ST77XX_WHITE, " %lu.%lums", draw_shown_ds / 10UL, draw_shown_ds % 10UL);
+    seg(y, col, ST77XX_YELLOW, "%-*s", label_w, "draw");
+    seg(y, col, ST77XX_WHITE, "%lu.%lums", draw_shown_ds / 10UL, draw_shown_ds % 10UL);
     seg(y, col, ST77XX_YELLOW, " max");
     seg(y, col, ST77XX_WHITE, " %lu.%lums", draw_max_ds / 10UL, draw_max_ds % 10UL);
     seg(y, col, ST77XX_YELLOW, " up");
-    seg_fill(y, col, ST77XX_WHITE, " %03lu:%02lu:%02lu", up_h, up_m, up_sec);
+    seg_fill(y, col, ST77XX_WHITE, " %lu:%02lu", up_m, up_sec);
 }
 
 void display::page_ids() noexcept
