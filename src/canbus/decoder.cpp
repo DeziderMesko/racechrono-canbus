@@ -149,23 +149,40 @@ void decoder::onWrite(BLECharacteristic* characteristic)
 
     uint8_t command = data[0];
 
-    debugln("ID request CMD %u LEN %u", command, len);
+    // info, not debug/verbose: these arrive a handful of times per connection, and
+    // they are the only record of what the app actually asked for. At the level
+    // setup() ships (info) the old verboseln calls never printed at all, which made
+    // the bench test that asks to read them off the console impossible to pass. The
+    // per-frame verboseln in the sketch is why the level cannot simply be raised.
+    infoln("ID request CMD %u LEN %u", command, len);
 
     switch (command)
     {
         case 0:
             if (len == 1)
             {
-                verboseln("ID request DENY all");
+                infoln("ID request DENY all");
                 deny_all();
+            }
+            else
+            {
+                // Every one of these arms used to fall out silently on a length it did
+                // not expect, leaving the previous filter state in force and saying
+                // nothing. A request that is understood and a request that is dropped
+                // have to look different on the console.
+                warnln("ID request DENY all BAD LEN %u, want 1", len);
             }
             break;
         case 1:
             if (len == 3)
             {
                 uint16_t notifyIntervalMs = data[1] << 8 | data[2];
-                verboseln("ID request ALLOW all INTERVAL %u ms", notifyIntervalMs);
+                infoln("ID request ALLOW all INTERVAL %u ms", notifyIntervalMs);
                 allow_all(notifyIntervalMs);
+            }
+            else
+            {
+                warnln("ID request ALLOW all BAD LEN %u, want 3", len);
             }
             break;
         case 2:
@@ -173,8 +190,12 @@ void decoder::onWrite(BLECharacteristic* characteristic)
             {
                 uint16_t notifyIntervalMs = data[1] << 8 | data[2];
                 uint32_t id = data[3] << 24 | data[4] << 16 | data[5] << 8 | data[6];
-                verboseln("ID request ALLOW ID 0x%03x INTERVAL %u ms", id, notifyIntervalMs);
+                infoln("ID request ALLOW ID 0x%03x INTERVAL %u ms", id, notifyIntervalMs);
                 allow_id(id, notifyIntervalMs);
+            }
+            else
+            {
+                warnln("ID request ALLOW ID BAD LEN %u, want 7", len);
             }
             break;
         default:
